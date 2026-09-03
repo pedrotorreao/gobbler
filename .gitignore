@@ -1,0 +1,45 @@
+# Binaries and executables
+gobbler
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binaries and coverage files
+*.test
+*.out
+coverage.out
+
+# Go workspace files
+go.work
+go.work.sum
+
+# Dependency directory
+# /vendor/
+
+# IDE and Editor files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+*.iml
+
+# Operating System files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Environment & Secret files
+.env
+.env.*
+!.env.example
+
+# Others
+plan01.md
+.markdownlint.json
