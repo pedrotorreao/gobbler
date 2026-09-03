@@ -2,13 +2,18 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net"
+	"os"
+	"os/signal"
 	"runtime"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 )
 
@@ -25,6 +30,11 @@ type MarketTick struct {
 var totalProcessed uint64
 
 func main() {
+	// Trap OS termination signals using signal.NotifyContext
+	// Catches Ctrl+C (SIGINT) and Kubernetes termination signals (SIGTERM)
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop() // Ensure the context is cancelled when the function exits
+
 	// 1. Allocate a bounded buffered channel for raw byte payloads:
 	const queueCapacity = 50000
 	jobQueue := make(chan []byte, queueCapacity)
@@ -32,16 +42,16 @@ func main() {
 	// 2. Spawn the Bounded Worker Pool
 	// Scale worker routines to available logical CPU cores for CPU-bounded tasks (JSON unmarshaling):
 	numWorkers := runtime.NumCPU()
-	var wg sync.WaitGroup
+	var workerWg sync.WaitGroup
 
 	fmt.Printf("Initializing %d processing workers...\n", numWorkers)
 	for i := 1; i <= numWorkers; i++ {
-		wg.Add(1)
-		go worker(i, jobQueue, &wg)
+		workerWg.Add(1)
+		go worker(i, jobQueue, &workerWg)
 	}
 
 	// 3. Background metrics reporter: prints throughput every second
-	go reportThroughput()
+	go reportThroughput(ctx)
 
 	// 4. Start the TCP Listener:
 	serverIPAddr := "127.0.0.1"
@@ -55,25 +65,75 @@ func main() {
 
 	fmt.Printf("Ingestion Gateway online at %s. Waiting for connections...", fmt.Sprintf("%s:%s", serverIPAddr, serverPort))
 
-	// 5. Connection Acceptance Loop:
-	for {
-		// Accept blocks execution until a client connects:
-		conn, err := listener.Accept()
-		if err != nil {
-			log.Printf("Failed to accept connection: %v", err)
-			continue
+	// Synchronization barriers for active connections:
+	var connWg sync.WaitGroup
+	var activeConns sync.Map // Thread-safe map to track active net.Conn references
+
+	// 5. Connection Acceptance Loop in its own goorutine so main can block on shutdown signals:
+	go func() {
+		for {
+			// Accept blocks execution until a client connects:
+			conn, err := listener.Accept()
+			if err != nil {
+				// When listener.Close() is called during shutdown, Accept returns net.ErrClosed
+				if errors.Is(err, net.ErrClosed) {
+					return // Normal shutdown exit
+				}
+				log.Printf("Failed to accept connection: %v", err)
+				continue
+			}
+
+			activeConns.Store(conn, struct{}{}) // Store empty struct as value to save memory
+			connWg.Add(1)
+
+			go func(c net.Conn) {
+				defer connWg.Done()
+				defer activeConns.Delete(c)
+				defer c.Close()
+
+				fmt.Printf("Client connected from: %s\n", conn.RemoteAddr().String())
+
+				// Read data from the client
+				handleConnection(c, jobQueue)
+			}(conn)
 		}
+	}()
 
-		fmt.Printf("Client connected from: %s\n", conn.RemoteAddr().String())
+	// 6. BLOCK main until an OS signal arrives:
+	<-ctx.Done()
+	fmt.Printf("\n[!] Shutdown signal received. Starting graceful drain...\n")
 
-		// 3. Read data from the client
-		go handleConnection(conn, jobQueue)
-	}
+	// Step A: Stop accepting new connections
+	listener.Close()
+	fmt.Println("[1/4] Listener closed. Rejecting new connections.")
+
+	// Step B: Sever existing client sockets to break blocked scanner loops
+	activeConns.Range(func(key, value any) bool {
+		if conn, ok := key.(net.Conn); ok {
+			remoteAddr := conn.RemoteAddr().String()
+			conn.Close()
+			fmt.Printf("[-] Connection closed: %s\n", remoteAddr)
+		}
+		return true
+	})
+
+	// Step C: Wait for all connection handler goroutines to finish pushing into jobQueue
+	connWg.Wait()
+	fmt.Println("[2/4] All connection handlers stopped. Zero incoming network writes remaining.")
+
+	// Step D: Safely close the jobQueue (guaranteed no more writers exist)
+	close(jobQueue)
+	fmt.Printf("[3/4] Closed job queue (%d buffered items remaining to drain).\n", len(jobQueue))
+
+	// Step E: Wait for all workers to finish processing remaining jobs in the channel
+	workerWg.Wait()
+	fmt.Println("[4/4] All worker threads terminated cleanly.")
+
+	finalCount := atomic.LoadUint64(&totalProcessed)
+	fmt.Printf("==> Shutdown complete. All systems terminated. Total ticks processed: %d\n", finalCount)
 }
 
 func handleConnection(conn net.Conn, jobQueue chan<- []byte) {
-	defer conn.Close() // Automatically close the socket when this function ends
-
 	remoteAddr := conn.RemoteAddr().String()
 	fmt.Printf("[+] New connection established: %s\n", remoteAddr)
 
@@ -97,12 +157,13 @@ func handleConnection(conn net.Conn, jobQueue chan<- []byte) {
 	if err := scanner.Err(); err != nil {
 		log.Printf("Scanner error on %s: %v", remoteAddr, err)
 	}
-	fmt.Printf("[-] Connection closed: %s\n", remoteAddr)
+
 }
 
 func worker(id int, jobs <-chan []byte, wg *sync.WaitGroup) {
 	defer wg.Done()
 
+	// The loop terminates automatically when jobQueue is closed AND completely empty
 	for payload := range jobs {
 		var tick MarketTick
 		if err := json.Unmarshal(payload, &tick); err != nil {
@@ -120,18 +181,24 @@ func worker(id int, jobs <-chan []byte, wg *sync.WaitGroup) {
 	}
 }
 
-func reportThroughput() {
+func reportThroughput(ctx context.Context) {
 	var lastCount uint64
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
 
-	for range ticker.C {
-		current := atomic.LoadUint64(&totalProcessed)
-		delta := current - lastCount
-		lastCount = current
+	for {
+		select {
+		case <-ctx.Done():
+			return // Exit reporter routine immediately on shutdown
+		case <-ticker.C:
+			current := atomic.LoadUint64(&totalProcessed)
+			delta := current - lastCount
+			lastCount = current
 
-		if delta > 0 {
-			fmt.Printf("==> Throughput: %d msgs/sec | Cumulative: %d msgs\n", delta, current)
+			if delta > 0 {
+				fmt.Printf("==> Throughput: %d msgs/sec | Cumulative: %d msgs\n", delta, current)
+			}
 		}
+
 	}
 }
