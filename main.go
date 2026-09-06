@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"net/http"         // Added for HTTP endpoint
+	_ "net/http/pprof" // Side-effect import registers /debug/pprof endpoints automatically
 	"os"
 	"os/signal"
 	"runtime"
@@ -63,11 +65,19 @@ func main() {
 	}
 	defer listener.Close()
 
-	fmt.Printf("Ingestion Gateway online at %s. Waiting for connections...", fmt.Sprintf("%s:%s", serverIPAddr, serverPort))
+	fmt.Printf("Ingestion Gateway online at %s. Waiting for connections...\n", fmt.Sprintf("%s:%s", serverIPAddr, serverPort))
 
 	// Synchronization barriers for active connections:
 	var connWg sync.WaitGroup
 	var activeConns sync.Map // Thread-safe map to track active net.Conn references
+
+	// Start pprof endpoint for metrics analysis in the background on an internal port
+	go func() {
+		log.Println("pprof server listening on http://127.0.0.1:6060/debug/pprof/")
+		if err := http.ListenAndServe("127.0.0.1:6060", nil); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Fatalf("pprof server error: %v", err)
+		}
+	}()
 
 	// 5. Connection Acceptance Loop in its own goorutine so main can block on shutdown signals:
 	go func() {
