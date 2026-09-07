@@ -1,3 +1,11 @@
+// Package generator provides a high-throughput synthetic financial exchange simulator.
+//
+// Key Responsibilities:
+//   - Simulates realistic order flows for stock tickers (PETR4, VALE3, ITUB4, BBDC4) using a random-walk algorithm.
+//   - Injects artificial market anomalies (flash crashes/pumps with high volume surges) for stream testing.
+//   - Concurrently generates tick streams across dedicated per-ticker goroutines.
+//   - Merges parallel streams into a single-writer channel loop to prevent concurrent socket write races on a single TCP connection.
+//   - Frames output payloads with a trailing newline ('\n') for stream framing by downstream scanners.
 package generator
 
 import (
@@ -10,23 +18,27 @@ import (
 	"time"
 )
 
-// MarketTick: defines the data schema contract across the distributed pipeline.
+// MarketTick defines the data schema contract for outgoing stock/crypto trade events across the pipeline.
 type MarketTick struct {
-	Ticker      string  `json:"ticker"`
-	Price       float64 `json:"price"`
-	Volume      int     `json:"volume"`
-	TimestampNs int16   `json:"timestamp_ns"`
-	IsAnomaly   bool    `json:"is_anomaly,omitempty"`
+	Ticker      string  `json:"ticker"`               // Financial ticker symbol (e.g., "PETR4", "VALE3")
+	Price       float64 `json:"price"`                // Executed trade price
+	Volume      int     `json:"volume"`               // Quantity of shares/contracts traded
+	TimestampNs int16   `json:"timestamp_ns"`         // Nanosecond timestamp modulo int16 range
+	IsAnomaly   bool    `json:"is_anomaly,omitempty"` // Synthetic anomaly flag
 }
 
-// TickerState: holds the evolving price state of an asset.
+// TickerState maintains the evolving runtime price state for a specific financial asset.
 type TickerState struct {
-	Symbol       string
-	CurrentPrice float64
+	Symbol       string  // Ticker identifier
+	CurrentPrice float64 // Latest calculated market price
 }
 
+// Generator establishes a TCP socket connection to the Gobbler ingestion gateway (127.0.0.1:8008),
+// initializes baseline ticker seeds, launches parallel ticker simulation goroutines, and streams framed ticks over TCP.
 func Generator() {
-	// 1. Establish the TCP connection to our ingestion gateway:
+	// -------------------------------------------------------------------------
+	// Step 1: Network Socket Dialing
+	// -------------------------------------------------------------------------
 	targetAddr := "127.0.0.1:8008"
 	conn, err := net.Dial("tcp", targetAddr)
 	if err != nil {
@@ -35,7 +47,10 @@ func Generator() {
 	defer conn.Close()
 	fmt.Printf("Connected to Ingestion Gateway at %s\n", targetAddr)
 
-	// 2. Baseline seed prices (derived from historical B3 closes):
+	// -------------------------------------------------------------------------
+	// Step 2: Asset Baseline Seeding
+	// -------------------------------------------------------------------------
+	// Initial prices seeded from representative B3 exchange asset levels.
 	seeds := []TickerState{
 		{Symbol: "PETR4", CurrentPrice: 38.50},
 		{Symbol: "VALE3", CurrentPrice: 60.20},
@@ -43,10 +58,12 @@ func Generator() {
 		{Symbol: "BBDC4", CurrentPrice: 14.80},
 	}
 
-	// 3. Channel to collect ticks from parallel generator routines:
+	// -------------------------------------------------------------------------
+	// Step 3: Stream Aggregation & Concurrent Simulation
+	// -------------------------------------------------------------------------
+	// Buffered channel to collect generated ticks from parallel ticker goroutines.
 	tickStream := make(chan MarketTick, 10000)
 
-	// Spin up a dedicated goroutine for each ticker to simulate independent order flows:
 	var wg sync.WaitGroup
 	for _, seed := range seeds {
 		wg.Add(1)
@@ -56,8 +73,11 @@ func Generator() {
 		}(seed)
 	}
 
-	// 4. Dedicated single-writer routine: drains the channel and writes to the TCP socket/consumer loop
-	// (Prevents concurrent write race conditions on a single net.Conn)
+	// -------------------------------------------------------------------------
+	// Step 4: Single-Writer Socket Dispatcher Loop
+	// -------------------------------------------------------------------------
+	// DESIGN PATTERN: A single dedicated goroutine drains tickStream and writes to net.Conn.
+	// This avoids data races and buffer corruption since net.Conn writes are not inherently thread-safe across concurrent routines.
 	go func() {
 		for tick := range tickStream {
 			payload, err := json.Marshal(tick)
@@ -65,7 +85,7 @@ func Generator() {
 				continue
 			}
 
-			// TCP Delimitation: append a newline byte ('\n') so the receiver can frame messages:
+			// Frame message with a trailing newline ('\n') so the TCP scanner can delimit lines.
 			payload = append(payload, '\n')
 
 			_, err = conn.Write(payload)
@@ -76,45 +96,52 @@ func Generator() {
 		}
 	}()
 
+	// Wait for simulation routines to finish (runs indefinitely unless stopped)
 	wg.Wait()
 }
 
+// simulateTicker runs an infinite loop generating price ticks for a given asset using a random walk.
+// It applies random price drift, generates trade volumes, injects synthetic anomalies, and pushes ticks into out.
 func simulateTicker(state TickerState, out chan<- MarketTick) {
+	// Initialize a local random number generator with a nanosecond seed per goroutine.
 	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
 
 	for {
-		// Random walk: price fluctuates within [-0.15%, +0.15%] per tick
+		// ---------------------------------------------------------------------
+		// Price Calculation: Random Walk (-0.15% to +0.15% fluctuation per tick)
+		// ---------------------------------------------------------------------
 		driftPercent := (rng.Float64() - 0.5) * 0.003
 		state.CurrentPrice += state.CurrentPrice * driftPercent
 		if state.CurrentPrice < 0.01 {
-			state.CurrentPrice = 0.01
+			state.CurrentPrice = 0.01 // Floor price at 1 cent
 		}
 
 		volume := rng.Intn(500) + 100 // Standard trade sizes (100 - 600 shares)
 		isAnomaly := false
 
-		// Anomaly injection: 0.1% chance of an artificial price crash or surge
+		// ---------------------------------------------------------------------
+		// Anomaly Injection: 0.1% probability of flash crash or surge
+		// ---------------------------------------------------------------------
 		if rng.Float64() < 0.001 {
 			isAnomaly = true
 			if rng.Float64() < 0.5 {
-				state.CurrentPrice *= 0.85 // 15% flash crash
+				state.CurrentPrice *= 0.85 // 15% sudden flash crash
 			} else {
-				state.CurrentPrice *= 1.15 // 15% sudden pump
+				state.CurrentPrice *= 1.15 // 15% sudden price pump
 			}
-			volume *= 20
+			volume *= 20 // 20x volume spike accompanying anomaly
 		}
 
 		out <- MarketTick{
 			Ticker:      state.Symbol,
-			Price:       float64(int(state.CurrentPrice*100)) / 100, // Round to 2 decimal places
+			Price:       float64(int(state.CurrentPrice*100)) / 100, // Round price to 2 decimal places
 			Volume:      volume,
 			TimestampNs: int16(time.Now().UnixNano()),
 			IsAnomaly:   isAnomaly,
 		}
 
-		// Adjust the frequency: sleep 500 microseconds = ~2000 ticks/sec per goroutine
+		// Throttle frequency: sleep 500 microseconds (~2,000 ticks/sec per ticker)
 		time.Sleep(500 * time.Microsecond)
-
-		fmt.Printf("Current state: %v", state)
 	}
 }
+
