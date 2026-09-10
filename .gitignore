@@ -41,5 +41,8 @@ Thumbs.db
 !.env.example
 
 # Others
-plan01.md
 .markdownlint.json
+redpanda.md
+questdb.md
+valkey.md
+

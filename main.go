@@ -6,6 +6,7 @@
 //   - Tracks active network socket references using thread-safe sync.Map to enable immediate socket severance on shutdown.
 //   - Dispatches payload scanning to handleConnection, copying byte slices to bypass bufio buffer recycling gotchas.
 //   - Distributes workloads to a CPU-scaled worker pool via a bounded job queue channel.
+//   - Dispatches validated, ticker-keyed ticks to a partitioned Redpanda broker using segmentio/kafka-go.
 //   - Exposes an embedded net/http/pprof diagnostic server on port 6060 for live performance profiling.
 package main
 
@@ -15,6 +16,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"         // Exposes HTTP endpoints for diagnostics
@@ -26,6 +28,8 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+
+	"github.com/segmentio/kafka-go"
 )
 
 // MarketTick defines the data schema contract for incoming stock/crypto trade events across the pipeline.
@@ -51,12 +55,25 @@ func main() {
 	defer stop() // Ensure signal resources are released when main exits
 
 	// -------------------------------------------------------------------------
-	// Step 2: Bounded Job Queue & Worker Pool Initialization
+	// Step 2: Bounded Job Queue, Kafka Producer & Worker Pool Initialization
 	// -------------------------------------------------------------------------
 	// Allocate a bounded buffered channel to hold raw byte payloads awaiting processing.
 	// Bounding the capacity (50,000) prevents unbounded memory growth under traffic spikes.
 	const queueCapacity = 50000
 	jobQueue := make(chan []byte, queueCapacity)
+
+	// Configure a thread-safe, batched Kafka writer targeting local Redpanda.
+	// Balancer: &kafka.Hash{} hashes the message key (asset ticker) to ensure
+	// strict per-asset FIFO ordering within dedicated topic partitions.
+	kafkaWriter := &kafka.Writer{
+		Addr:         kafka.TCP("localhost:9092"), // Redpanda/Kafka broker endpoint
+		Topic:        "market-ticks",              // Target event stream topic for financial trade ticks
+		Balancer:     &kafka.Hash{},               // Key hasher (fnv-1a) ensuring deterministic, strict per-ticker FIFO ordering
+		BatchSize:    100,                         // Maximum message count before triggering an immediate batch write
+		BatchTimeout: 5 * time.Millisecond,        // Flush interval threshold to minimize streaming latency during low volume
+		RequiredAcks: kafka.RequireOne,            // Await confirmation from the partition leader before considering write successful
+		WriteTimeout: 2 * time.Second,             // Fail-safe deadline to prevent worker goroutines from blocking on dead brokers
+	}
 
 	// Scale worker goroutines to match the available logical CPU cores for CPU-bound JSON parsing.
 	numWorkers := runtime.NumCPU()
@@ -65,7 +82,7 @@ func main() {
 	fmt.Printf("Initializing %d processing workers...\n", numWorkers)
 	for i := 1; i <= numWorkers; i++ {
 		workerWg.Add(1)
-		go worker(i, jobQueue, &workerWg)
+		go worker(i, jobQueue, &workerWg, kafkaWriter)
 	}
 
 	// -------------------------------------------------------------------------
@@ -145,7 +162,7 @@ func main() {
 
 	// Phase A: Close the TCP listener to block any new incoming connections.
 	listener.Close()
-	fmt.Println("[1/4] Listener closed. Rejecting new connections.")
+	fmt.Println("[1/5] Listener closed. Rejecting new connections.")
 
 	// Phase B: Sever existing client sockets to interrupt blocked bufio.Scanner loops.
 	activeConns.Range(func(key, value any) bool {
@@ -159,15 +176,21 @@ func main() {
 
 	// Phase C: Wait for all connection handler goroutines to stop pushing to jobQueue.
 	connWg.Wait()
-	fmt.Println("[2/4] All connection handlers stopped. Zero incoming network writes remaining.")
+	fmt.Println("[2/5] All connection handlers stopped. Zero incoming network writes remaining.")
 
 	// Phase D: Safely close the jobQueue channel (guaranteed no active producers exist).
 	close(jobQueue)
-	fmt.Printf("[3/4] Closed job queue (%d buffered items remaining to drain).\n", len(jobQueue))
+	fmt.Printf("[3/5] Closed job queue (%d buffered items remaining to drain).\n", len(jobQueue))
 
 	// Phase E: Wait for all worker goroutines to drain the channel and finish processing.
 	workerWg.Wait()
-	fmt.Println("[4/4] All worker threads terminated cleanly.")
+	fmt.Println("[4/5] All worker threads terminated cleanly.")
+
+	// Phase F: Flush remaining buffered batches to Redpanda and close producer connections.
+	if err := kafkaWriter.Close(); err != nil {
+		log.Printf("[ERROR] Failed to close Kafka writer: %v\n", err)
+	}
+	fmt.Println("[5/5] Redpanda producer closed cleanly.")
 
 	finalCount := atomic.LoadUint64(&totalProcessed)
 	fmt.Printf("==> Shutdown complete. All systems terminated. Total ticks processed: %d\n", finalCount)
@@ -202,8 +225,9 @@ func handleConnection(conn net.Conn, jobQueue chan<- []byte) {
 }
 
 // worker is a consumer routine in the worker pool. It reads raw byte payloads from jobs,
-// unmarshals them into MarketTick structs, updates global metrics, and flags anomalies.
-func worker(id int, jobs <-chan []byte, wg *sync.WaitGroup) {
+// unmarshals them into MarketTick structs, publishes them to Redpanda partitioned by ticker symbol,
+// updates global throughput metrics, and flags anomalies.
+func worker(id int, jobs <-chan []byte, wg *sync.WaitGroup, writer *kafka.Writer) {
 	defer wg.Done()
 
 	// Range loop continuously receives jobs until jobs channel is closed AND fully drained.
@@ -213,12 +237,53 @@ func worker(id int, jobs <-chan []byte, wg *sync.WaitGroup) {
 			continue // In production, route corrupted payloads to a Dead Letter Queue (DLQ)
 		}
 
+		// Construct Kafka message:
+		// - Key: Ticker symbol (hashed by &kafka.Hash{} to guarantee strict per-asset FIFO ordering)
+		// - Value: Reuses validated JSON byte slice (zero re-serialization / allocation overhead)
+		msg := kafka.Message{
+			Key:   []byte(tick.Ticker),
+			Value: payload,
+		}
+
+		// Dispatch message to Redpanda broker with exponential backoff retry resilience.
+		// Uses context.Background() so in-flight items drain successfully even if root ctx is canceled.
+		if !dispatchMsg(id, context.Background(), msg, writer) {
+			return // Gateway writer is closed during shutdown; terminate worker
+		}
+
 		// Increment atomic throughput metric counter
 		atomic.AddUint64(&totalProcessed, 1)
 
 		// Log alerted anomalies detected by the synthetic generator
 		if tick.IsAnomaly {
 			fmt.Printf("[WORKER %d ALERT] Injected Anomaly Caught: %s @ $%.2f (Vol: %d)\n", id, tick.Ticker, tick.Price, tick.Volume)
+		}
+	}
+}
+
+// dispatchMsg attempts to write a message to Redpanda with exponential backoff.
+// It retries indefinitely on broker outages to ensure zero message loss, applying natural backpressure
+// to the worker pool and incoming TCP streams. Returns false if the writer was closed during shutdown.
+func dispatchMsg(workerID int, ctx context.Context, msg kafka.Message, writer *kafka.Writer) bool {
+	backoff := 50 * time.Millisecond
+	const maxBackoff = 1 * time.Second
+
+	for {
+		err := writer.WriteMessages(ctx, msg)
+		if err == nil {
+			return true // Successfully published
+		}
+		if errors.Is(err, io.ErrClosedPipe) {
+			return false // Gateway is shutting down and writer closed
+		}
+
+		log.Printf("[WORKER %d WARNING] Redpanda write failed: %v. Retrying in %v...", workerID, err, backoff)
+		time.Sleep(backoff)
+
+		// Exponential backoff: double the sleep interval up to maxBackoff
+		backoff *= 2
+		if backoff > maxBackoff {
+			backoff = maxBackoff
 		}
 	}
 }

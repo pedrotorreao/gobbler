@@ -1,0 +1,16 @@
+services:
+  redpanda:
+    image: docker.redpanda.com/redpandadata/redpanda:latest
+    container_name: redpanda
+    command:
+      - redpanda
+      - start
+      - --mode dev-container      # Configures Redpanda for local development (shares resources gracefully)
+      - --smp 1                   # Limits Redpanda to 1 CPU core
+      - --memory 1G               # Memory limit
+      - --kafka-addr 0.0.0.0:9092 # Listens on all container interfaces for Kafka wire protocol
+      - --advertise-kafka-addr localhost:9092 # Tells clients (our Go gateway) to connect via localhost
+    ports:
+      - "9092:9092"               # Kafka API port
+      - "9644:9644"               # Admin API port (used by rpk CLI)
+    # Notice: NO volumes declared -> 100% ephemeral!

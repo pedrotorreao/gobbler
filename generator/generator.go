@@ -6,7 +6,7 @@
 //   - Concurrently generates tick streams across dedicated per-ticker goroutines.
 //   - Merges parallel streams into a single-writer channel loop to prevent concurrent socket write races on a single TCP connection.
 //   - Frames output payloads with a trailing newline ('\n') for stream framing by downstream scanners.
-package generator
+package main
 
 import (
 	"encoding/json"
@@ -35,7 +35,7 @@ type TickerState struct {
 
 // Generator establishes a TCP socket connection to the Gobbler ingestion gateway (127.0.0.1:8008),
 // initializes baseline ticker seeds, launches parallel ticker simulation goroutines, and streams framed ticks over TCP.
-func Generator() {
+func main() {
 	// -------------------------------------------------------------------------
 	// Step 1: Network Socket Dialing
 	// -------------------------------------------------------------------------
@@ -144,4 +144,3 @@ func simulateTicker(state TickerState, out chan<- MarketTick) {
 		time.Sleep(500 * time.Microsecond)
 	}
 }
-
