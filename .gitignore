@@ -46,3 +46,5 @@ redpanda.md
 questdb.md
 valkey.md
 
+consumer/.venv/
+__pycache__/
