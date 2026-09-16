@@ -23,7 +23,7 @@ type MarketTick struct {
 	Ticker      string  `json:"ticker"`               // Financial ticker symbol (e.g., "PETR4", "VALE3")
 	Price       float64 `json:"price"`                // Executed trade price
 	Volume      int     `json:"volume"`               // Quantity of shares/contracts traded
-	TimestampNs int16   `json:"timestamp_ns"`         // Nanosecond timestamp modulo int16 range
+	TimestampNs int64   `json:"timestamp_ns"`         // Nanosecond timestamp modulo int16 range
 	IsAnomaly   bool    `json:"is_anomaly,omitempty"` // Synthetic anomaly flag
 }
 
@@ -52,10 +52,20 @@ func main() {
 	// -------------------------------------------------------------------------
 	// Initial prices seeded from representative B3 exchange asset levels.
 	seeds := []TickerState{
-		{Symbol: "PETR4", CurrentPrice: 38.50},
-		{Symbol: "VALE3", CurrentPrice: 60.20},
-		{Symbol: "ITUB4", CurrentPrice: 34.10},
-		{Symbol: "BBDC4", CurrentPrice: 14.80},
+		// Partition 0
+		{Symbol: "PETR4", CurrentPrice: 38.50}, // Energy
+		{Symbol: "VALE3", CurrentPrice: 60.20}, // Mining
+		{Symbol: "BBDC4", CurrentPrice: 14.80}, // Financials
+		{Symbol: "JBSS3", CurrentPrice: 35.40}, // Protein / Meatpacking
+		// Partition 1
+		{Symbol: "ITUB4", CurrentPrice: 34.10}, // Financials
+		// Partition 2
+		{Symbol: "ABEV3", CurrentPrice: 12.50}, // Beverages
+		{Symbol: "BBAS3", CurrentPrice: 27.30}, // Financials
+		{Symbol: "WEGE3", CurrentPrice: 52.10}, // Industrials / Capital Goods
+		// Partition 3
+		{Symbol: "MGLU3", CurrentPrice: 9.80},  // Retail / E-commerce
+		{Symbol: "RENT3", CurrentPrice: 44.60}, // Car Rental / Logistics
 	}
 
 	// -------------------------------------------------------------------------
@@ -136,7 +146,7 @@ func simulateTicker(state TickerState, out chan<- MarketTick) {
 			Ticker:      state.Symbol,
 			Price:       float64(int(state.CurrentPrice*100)) / 100, // Round price to 2 decimal places
 			Volume:      volume,
-			TimestampNs: int16(time.Now().UnixNano()),
+			TimestampNs: int64(time.Now().UnixNano()),
 			IsAnomaly:   isAnomaly,
 		}
 

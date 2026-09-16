@@ -37,7 +37,7 @@ type MarketTick struct {
 	Ticker      string  `json:"ticker"`               // Financial ticker symbol (e.g., "PETR4", "BTC-USD")
 	Price       float64 `json:"price"`                // Executed trade price
 	Volume      int     `json:"volume"`               // Quantity of shares/contracts traded
-	TimestampNs int16   `json:"timestamp_ns"`         // High-resolution nanosecond timestamp
+	TimestampNs int64   `json:"timestamp_ns"`         // High-resolution nanosecond timestamp
 	IsAnomaly   bool    `json:"is_anomaly,omitempty"` // Synthetic anomaly flag emitted by the generator
 }
 
