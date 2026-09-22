@@ -109,6 +109,7 @@ def run_consumer():
             tick_data = json.loads(msg.value().decode('utf-8'))
             ticker = tick_data.get('ticker')
             price = tick_data.get('price')
+            volume = int(tick_data.get('volume') or 0)
             timestamp = tick_data.get('timestamp_ns')
 
             # ------------------------------------------------------------------
@@ -132,9 +133,9 @@ def run_consumer():
             # ------------------------------------------------------------------
             # Step 4: Stream Inference & Anomaly Detection (Phase 3, Step 4)
             # ------------------------------------------------------------------
-            is_anomaly, z_score = detector.evaluate(ticker, price)
+            is_anomaly, z_score, ml_score = detector.evaluate(ticker, price, volume)
             if is_anomaly:
-                print(f"[ANOMALY ALERT] {ticker} @ ${price:.2f} (Z-Score: {z_score:+.2f})")
+                print(f"[ANOMALY ALERT] {ticker} @ ${price:.2f} (Vol: {volume}, Z-Score: {z_score:+.2f}, ML-Score: {ml_score:.3f})")
             else:
                 print(f"Received: Ticker={ticker}, Price={price}, Timestamp={timestamp}")
 

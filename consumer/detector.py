@@ -1,36 +1,75 @@
 """Real-Time Statistical Anomaly Detector for Financial Market Streams.
 
-This module provides a sliding-window Z-Score detector equipped with a
-Dual-Condition Guard designed for high-frequency financial time-series.
+This module provides a two-tier, sliding-window anomaly detector for high-frequency
+financial time-series. Each tier is an independent detector targeting a complementary
+class of market anomalies:
 
-Key Mathematical Concepts:
-1. Rolling Baseline:
-   Maintains a per-ticker circular buffer (collections.deque) of historical trade
-   prices to dynamically compute the rolling mean (μ) and standard deviation (σ).
-2. Z-Score Profiling:
-   Calculates how many standard deviations an incoming price sits away from the
-   established baseline:
-       Z = (P_t - μ) / σ
-3. Dual-Condition Guard (Anti Micro-Volatility Trap):
-   In extremely quiet markets (σ ≈ 0), a tiny cent fluctuation can produce an
-   artificially massive Z-Score. The detector guards against false positives by
-   requiring both:
-       (a) Statistical Outlier: |Z| > z_threshold (e.g. 3.0, representing <0.27% probability)
-       (b) Material Shock: |P_t - μ| / μ >= min_pct_change (e.g. 2.0% price move)
+Tier 1 — Statistical Profiling (Dual-Condition Z-Score Guard):
+    Maintains a per-ticker circular buffer (collections.deque) of `(price, volume)`
+    tuples to dynamically compute rolling statistics. An anomaly is flagged only when
+    BOTH conditions hold simultaneously:
+        (a) Statistical Outlier: |Z| > z_threshold  (e.g. 3.0, i.e. <0.27% probability)
+            Z = (P_t - μ) / σ_effective
+        (b) Material Shock: |P_t - μ| / μ >= min_pct_change  (e.g. 2.0% price move)
+    The AND-gate prevents the Micro-Volatility Trap: in frozen or illiquid markets
+    (σ ≈ 0), even a $0.01 price wiggle produces a massive Z-score. Requiring both
+    a statistical outlier AND a minimum percentage move eliminates these false positives.
+
+Tier 2 — Unsupervised ML (IsolationForest on Normalized Feature Space):
+    An sklearn.ensemble.IsolationForest is fitted on the rolling window every
+    `refit_interval` ticks. Features are normalized to rolling Z-scores before
+    training and inference:
+        features = [z_price, z_volume] = [(P_t - μ_P) / σ_P, (V_t - μ_V) / σ_V]
+    Normalization serves two purposes:
+        1. Scale Equalization: Raw price (cents range) and volume (hundreds range)
+           have incompatible scales. Without normalization, volume dominates all
+           random coordinate splits in the isolation trees.
+        2. Stationarity: Normalizing to Z-scores always centers the normal cluster
+           at (0, 0) regardless of market price level or regime drift.
+    Anomaly scoring uses score_samples() (continuous path-length score) rather than
+    predict() (binary contamination threshold) to avoid the Contamination Trap:
+    with contamination=0.02, predict() guarantees 2% of any training window is
+    labeled -1, even when no real anomalies exist.
+
+Detection Logic (Independent OR):
+    is_anomaly = tier1_anomaly  OR  (ml_scored_sample < -0.65)
+    Either tier can independently trigger an alert:
+    - Tier 1 catches: sharp univariate price shocks (flash crashes, pumps).
+    - Tier 2 catches: multivariate co-movement anomalies (e.g., extreme volume
+      spikes with no significant price change, which Tier 1 cannot detect).
+
+Zero-Volatility Guard:
+    A single effective std array floors both axes before any division:
+        stds_effective = np.maximum(stds, [0.01, 1])
+    - Price floor: $0.01 (minimum equity tick size).
+    - Volume floor: 1 share (minimum atomic volume unit).
+    This prevents ZeroDivisionError and NaN corruption of the training matrix when
+    a stock is halted or all window volumes are identical.
 """
 
 from collections import defaultdict, deque
 import numpy as np
+from sklearn.ensemble import IsolationForest
 
 
 class RollingZScoreDetector:
-    """Detects price anomalies across streaming assets using sliding-window statistics.
+    """Detects price and volume anomalies across streaming assets using a two-tier approach.
+
+    Tier 1 (Statistical): A Dual-Condition Z-Score guard flags univariate price shocks.
+    Tier 2 (ML): An IsolationForest trained on normalized [z_price, z_volume] features
+    flags multivariate co-movement anomalies (e.g., pure volume spikes) that Tier 1
+    cannot detect. Both tiers are independent — either can trigger an alert.
 
     Parameters:
-        window_size: Maximum capacity of the rolling circular buffer per asset.
-        z_threshold: Number of standard deviations required to flag an anomaly (default 3.0).
-        min_observations: Minimum number of historical ticks required before scoring (cold-start guard).
-        min_pct_change: Minimum relative price move (|P_t - μ| / μ) required to trigger an alert.
+        window_size: Maximum capacity of the rolling circular buffer per asset (default 100).
+        z_threshold: Number of standard deviations required for a Tier 1 outlier (default 3.0).
+        min_observations: Minimum buffer size before scoring begins; guards against cold-start
+            instability where std and mean are statistically unreliable (default 20).
+        min_pct_change: Minimum relative price move required alongside the Z-score outlier
+            to confirm a Tier 1 anomaly. Prevents false positives in frozen markets
+            where σ ≈ 0 inflates Z-scores on noise (default 0.02 = 2%).
+        refit_interval: Number of ticks between periodic IsolationForest re-fits.
+            Keeps the ML model aligned with the current market regime (default 100).
     """
 
     def __init__(
@@ -39,33 +78,58 @@ class RollingZScoreDetector:
         z_threshold: float = 3.0,
         min_observations: int = 20,
         min_pct_change: float = 0.02,
+        refit_interval: int = 100
     ):
         self.window_size = window_size
         self.z_threshold = z_threshold
         self.min_observations = min_observations
         self.min_pct_change = min_pct_change
+        self.refit_interval = refit_interval
 
         # Circular buffer per ticker: ticker -> deque(maxlen=window_size)
         # O(1) appends and automatic eviction of oldest ticks with zero array reallocations.
-        self.price_history: dict[str, deque[float]] = defaultdict(lambda: deque(maxlen=window_size))
+        # Ticker -> deque of (price, volume) tuples
+        self.asset_history: dict[str, deque[tuple[float, int]]] = defaultdict(lambda: deque(maxlen=window_size))
+        # Ticker -> IsolationForest instance
+        self.models: dict[str, IsolationForest] = defaultdict(lambda: IsolationForest(
+            n_estimators=50,        # 50 trees cuts CPU inference latency in half (< 0.5ms)
+            contamination=0.02,     # Calibrates the anomaly boundary for a 2% baseline outlier rate
+            random_state=42,        # Deterministic and reproducible splits
+        ))
+        # Ticker -> tick counter for periodic re-fitting
+        self.tick_counters = defaultdict(int)
 
-    def evaluate(self, ticker: str, price: float) -> tuple[bool, float]:
-        """Evaluates an incoming trade price against the asset's rolling baseline.
+    def evaluate(self, ticker: str, price: float, volume: int) -> tuple[bool, float, float]:
+        """Evaluates an incoming trade tick against the asset's rolling two-tier baseline.
 
-        The incoming price is evaluated against the historical baseline BEFORE being
-        appended to the window to prevent extreme outliers from distorting their
-        own Z-Score (avoiding the statistical 'masking effect').
+        Evaluation Order:
+            1. Cold-Start Guard: Returns early if the buffer is under-populated.
+            2. Baseline Statistics: Computes rolling mean and floored std from the window.
+            3. Tier 1: Checks the Dual-Condition Z-Score guard on price.
+            4. Tier 2: Fits (or re-fits) the IsolationForest on normalized window data,
+               then scores the incoming [z_price, z_volume] feature vector.
+            5. Anomaly Decision: is_anomaly = tier1_anomaly OR (ml_score < -0.65).
+            6. Window Ingestion: Appends the tick AFTER scoring to prevent the masking
+               effect — extreme outliers should not distort their own Z-score.
 
         Args:
             ticker: The financial asset symbol (e.g., 'PETR4', 'VALE3').
-            price: The latest executed trade price.
+            price: The latest executed trade price in currency units.
+            volume: The latest executed trade volume in number of shares/contracts.
+                Used as the second feature dimension for the IsolationForest. A volume
+                spike alone (without a price shock) can trigger a Tier 2 alert even
+                when Tier 1 remains silent.
 
         Returns:
-            tuple[bool, float]:
-                - is_anomaly (bool): True if the tick triggers the dual-condition guard.
-                - z_score (float): The calculated Z-score (standard deviations from mean).
+            tuple[bool, float, float]:
+                - is_anomaly (bool): True if either Tier 1 or Tier 2 detects an anomaly.
+                - z_score (float): The Tier 1 price Z-score (standard deviations from rolling
+                    mean). Returns 0.0 during the cold-start warm-up period.
+                - ml_score (float): The Tier 2 IsolationForest score_samples output.
+                    Interpretation: > -0.45 normal cluster, -0.45 to -0.60 borderline,
+                    < -0.65 isolated outlier. Returns 0.0 before the 100-tick ML warm-up.
         """
-        history = self.price_history[ticker]
+        history = self.asset_history[ticker]
 
         # ----------------------------------------------------------------------
         # 1. Cold-Start Guard
@@ -73,37 +137,64 @@ class RollingZScoreDetector:
         # Standard deviation and mean are statistically unreliable with too few samples.
         # Warm up the circular buffer before scoring anomalies.
         if len(history) < self.min_observations:
-            history.append(price)
-            return False, 0.0
+            history.append((price, int(volume)))
+            self.tick_counters[ticker] += 1
+            return False, 0.0, 0.0
 
         # ----------------------------------------------------------------------
         # 2. Compute Baseline Statistics
         # ----------------------------------------------------------------------
         # Compute baseline gravity center (mean μ) and volatility (std dev σ)
-        mean = float(np.mean(history))
-        std_deviation = float(np.std(history))
+        data = np.array(history)
+        means = np.mean(data, axis=0)
+        stds = np.std(data, axis=0)
 
         # ----------------------------------------------------------------------
         # 3. Guard Against Zero-Volatility (Micro-Volatility Trap)
         # ----------------------------------------------------------------------
         # Floor effective volatility at 1 cent ($0.01) to prevent division-by-zero errors.
-        std_effective = max(std_deviation, 0.01)
-        z_score = (price - mean) / std_effective
-
-        # Calculate material percentage change relative to baseline
-        pct_change = abs(price - mean) / mean if mean > 0.0 else 0.0
-
-        # ----------------------------------------------------------------------
-        # 4. Dual-Condition Anomaly Verification
-        # ----------------------------------------------------------------------
-        # Must be BOTH a statistical outlier (|Z| > threshold) AND a financially
-        # material shock (percentage move >= min_pct_change).
-        is_anomaly = (abs(z_score) > self.z_threshold) and (pct_change >= self.min_pct_change)
+        stds_effective = np.maximum(stds, [0.01, 1])
+        z_price = (price - means[0]) / stds_effective[0]
+        pct_change = abs(price - means[0]) / means[0] if means[0] > 0.0 else 0.0
+        
+        # Tier 1: Dual-Condition Z-Score on Price
+        tier1_anomaly = (abs(z_price) > self.z_threshold) and (pct_change >= self.min_pct_change)
 
         # ----------------------------------------------------------------------
-        # 5. Window Ingestion (Regime Adaptation)
+        # 4. Calculate Isolation Forest Anomaly Score
+        # ----------------------------------------------------------------------
+        ml_scored_sample = 0.0
+
+        if len(history) >= 100:
+            # 1. Fit the model as soon as the cold start concludes (len(history) >= min_observations) or
+            #    periodically re-fit model if needed (every refit_interval ticks)
+            history_normalized = (data - means) / stds_effective
+            if (not hasattr(self.models[ticker], "estimators_")) or (self.tick_counters[ticker] % self.refit_interval == 0):
+                self.models[ticker].fit(np.array(history_normalized))
+        
+            # 2. Score sample: x > -0.45 = normal, -0.55 <= x <= -0.45 = border, <= -0.55 = anomaly
+            price_normalized = (price - means[0]) / stds_effective[0]
+            volume_normalized = (volume - means[1]) / stds_effective[1]
+            ml_scored_sample = self.models[ticker].score_samples([[price_normalized, volume_normalized]])[0]
+        
+        # ----------------------------------------------------------------------
+        # 5. Two-Tier Anomaly Decision (Independent OR)
+        # ----------------------------------------------------------------------
+        # Either tier independently triggers an alert:
+        #   - Tier 1 (tier1_anomaly): Price Z-score exceeds threshold AND percentage
+        #     move is financially material. Catches sharp univariate price shocks.
+        #   - Tier 2 (ml_scored_sample < -0.65): IsolationForest path-length score
+        #     indicates the [z_price, z_volume] feature vector is geometrically isolated
+        #     from the normal cluster. Catches multivariate co-movement anomalies,
+        #     including pure volume spikes that produce no significant price movement.
+        is_anomaly = tier1_anomaly or (ml_scored_sample < -0.65)
+
+        # ----------------------------------------------------------------------
+        # 6. Window Ingestion (Regime Adaptation)
         # ----------------------------------------------------------------------
         # Append the price to allow the window to adapt to genuine regime shifts
-        history.append(price)
+        history.append((price, volume))
 
-        return bool(is_anomaly), float(z_score)
+        self.tick_counters[ticker] += 1
+
+        return bool(is_anomaly), float(z_price), float(ml_scored_sample)
