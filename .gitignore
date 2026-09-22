@@ -42,9 +42,6 @@ Thumbs.db
 
 # Others
 .markdownlint.json
-redpanda.md
-questdb.md
-valkey.md
 
 consumer/.venv/
 __pycache__/
