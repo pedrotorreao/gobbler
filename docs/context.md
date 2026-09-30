@@ -9,8 +9,8 @@
 Gobbler is a distributed real-time financial market surveillance and anomaly detection platform simulating high-throughput exchange data (~50,000 msgs/sec), ingesting it through a low-latency network gateway, streaming it via an event broker, detecting price anomalies with Python ML workers, and persisting records in a time-series database.
 
 * **Tech Stack**: Go 1.22+, Docker & Docker Compose, Redpanda (Kafka API), Python (NumPy/Scikit-learn - Phase 3), Valkey (Phase 3), QuestDB (Phase 4), Kind/OpenTofu (Phase 4).
-* **Roadmap Reference**: [`plan01.md`](file:///home/pedrotorreao/Documents/Projects/gobbler/plan01.md)
-* **Redpanda Deep Dive**: [`redpanda.md`](file:///home/pedrotorreao/Documents/Projects/gobbler/redpanda.md)
+* **Roadmap Reference**: [`plan.md`](file:///home/pedrotorreao/Documents/Projects/gobbler/docs/plan.md)
+* **Redpanda Deep Dive**: [`redpanda.md`](file:///home/pedrotorreao/Documents/Projects/gobbler/docs/redpanda.md)
 
 ---
 
