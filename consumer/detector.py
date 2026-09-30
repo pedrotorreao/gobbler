@@ -50,7 +50,29 @@ Zero-Volatility Guard:
 from collections import defaultdict, deque
 import numpy as np
 from sklearn.ensemble import IsolationForest
+from enum import IntEnum
 
+class AnomalyTierIndicator(IntEnum):
+    """Identifies which detection tier(s) triggered a confirmed anomaly.
+
+    Returned as the fourth element of RollingZScoreDetector.evaluate().
+    Serialized as its string name (e.g., 'STATISTICAL') in the anomaly
+    JSON payload emitted to the 'market-anomalies' topic.
+
+    Members:
+        NONE (0):        No anomaly detected. Default value when is_anomaly is False.
+        STATISTICAL (1): Only Tier 1 (Z-Score Dual-Condition Guard) triggered.
+                         Indicates a sharp univariate price shock (flash crash, pump).
+        ML (2):          Only Tier 2 (IsolationForest score_samples) triggered.
+                         Indicates a multivariate co-movement anomaly (e.g., volume
+                         spike with no significant price move — invisible to Tier 1).
+        BOTH (3):        Both tiers independently triggered on the same tick.
+                         Highest confidence anomaly signal.
+    """
+    NONE = 0
+    STATISTICAL = 1
+    ML = 2
+    BOTH = 3
 
 class RollingZScoreDetector:
     """Detects price and volume anomalies across streaming assets using a two-tier approach.
@@ -70,6 +92,9 @@ class RollingZScoreDetector:
             where σ ≈ 0 inflates Z-scores on noise (default 0.02 = 2%).
         refit_interval: Number of ticks between periodic IsolationForest re-fits.
             Keeps the ML model aligned with the current market regime (default 100).
+        ml_score_delay: Number of ticks to wait before computing the IsolationForest
+            score. This allows the ML model to build a more robust baseline before
+            scoring (default 500).
     """
 
     def __init__(
@@ -78,13 +103,15 @@ class RollingZScoreDetector:
         z_threshold: float = 3.0,
         min_observations: int = 20,
         min_pct_change: float = 0.02,
-        refit_interval: int = 100
+        refit_interval: int = 100,
+        ml_score_delay: int = 500
     ):
         self.window_size = window_size
         self.z_threshold = z_threshold
         self.min_observations = min_observations
         self.min_pct_change = min_pct_change
         self.refit_interval = refit_interval
+        self.ml_score_delay = ml_score_delay
 
         # Circular buffer per ticker: ticker -> deque(maxlen=window_size)
         # O(1) appends and automatic eviction of oldest ticks with zero array reallocations.
@@ -99,15 +126,17 @@ class RollingZScoreDetector:
         # Ticker -> tick counter for periodic re-fitting
         self.tick_counters = defaultdict(int)
 
-    def evaluate(self, ticker: str, price: float, volume: int) -> tuple[bool, float, float]:
+    def evaluate(self, ticker: str, price: float, volume: int) -> tuple[bool, float, float, AnomalyTierIndicator]:
         """Evaluates an incoming trade tick against the asset's rolling two-tier baseline.
 
         Evaluation Order:
             1. Cold-Start Guard: Returns early if the buffer is under-populated.
             2. Baseline Statistics: Computes rolling mean and floored std from the window.
             3. Tier 1: Checks the Dual-Condition Z-Score guard on price.
-            4. Tier 2: Fits (or re-fits) the IsolationForest on normalized window data,
-               then scores the incoming [z_price, z_volume] feature vector.
+            4. Tier 2: Once tick_counters[ticker] >= ml_score_delay, fits (or re-fits)
+               the IsolationForest on normalized window data and scores the incoming
+               [z_price, z_volume] feature vector. Gated by ml_score_delay to ensure
+               the model trains on a representative regime before its scores are trusted.
             5. Anomaly Decision: is_anomaly = tier1_anomaly OR (ml_score < -0.65).
             6. Window Ingestion: Appends the tick AFTER scoring to prevent the masking
                effect — extreme outliers should not distort their own Z-score.
@@ -121,13 +150,20 @@ class RollingZScoreDetector:
                 when Tier 1 remains silent.
 
         Returns:
-            tuple[bool, float, float]:
+            tuple[bool, float, float, AnomalyTierIndicator]:
                 - is_anomaly (bool): True if either Tier 1 or Tier 2 detects an anomaly.
                 - z_score (float): The Tier 1 price Z-score (standard deviations from rolling
                     mean). Returns 0.0 during the cold-start warm-up period.
                 - ml_score (float): The Tier 2 IsolationForest score_samples output.
                     Interpretation: > -0.45 normal cluster, -0.45 to -0.60 borderline,
-                    < -0.65 isolated outlier. Returns 0.0 before the 100-tick ML warm-up.
+                    < -0.65 isolated outlier. Returns 0.0 during the ml_score_delay
+                    warm-up period (first ml_score_delay ticks per ticker).
+                - anomaly_tier (AnomalyTierIndicator): Identifies which tier(s) fired.
+                    AnomalyTierIndicator.NONE when is_anomaly is False.
+                    AnomalyTierIndicator.STATISTICAL when only Tier 1 triggered.
+                    AnomalyTierIndicator.ML when only Tier 2 triggered.
+                    AnomalyTierIndicator.BOTH when both tiers fired on the same tick
+                    (highest confidence signal).
         """
         history = self.asset_history[ticker]
 
@@ -139,7 +175,7 @@ class RollingZScoreDetector:
         if len(history) < self.min_observations:
             history.append((price, int(volume)))
             self.tick_counters[ticker] += 1
-            return False, 0.0, 0.0
+            return False, 0.0, 0.0, AnomalyTierIndicator.NONE
 
         # ----------------------------------------------------------------------
         # 2. Compute Baseline Statistics
@@ -165,8 +201,8 @@ class RollingZScoreDetector:
         # ----------------------------------------------------------------------
         ml_scored_sample = 0.0
 
-        if len(history) >= 100:
-            # 1. Fit the model as soon as the cold start concludes (len(history) >= min_observations) or
+        if self.tick_counters[ticker] >= self.ml_score_delay:
+            # 1. Fit the model as soon as the warm up period for the ML layer concludes or
             #    periodically re-fit model if needed (every refit_interval ticks)
             history_normalized = (data - means) / stds_effective
             if (not hasattr(self.models[ticker], "estimators_")) or (self.tick_counters[ticker] % self.refit_interval == 0):
@@ -189,6 +225,15 @@ class RollingZScoreDetector:
         #     including pure volume spikes that produce no significant price movement.
         is_anomaly = tier1_anomaly or (ml_scored_sample < -0.65)
 
+        anomaly_tier = AnomalyTierIndicator.NONE
+        if is_anomaly:
+            if tier1_anomaly and ml_scored_sample < -0.65:
+                anomaly_tier = AnomalyTierIndicator.BOTH
+            elif tier1_anomaly:
+                anomaly_tier = AnomalyTierIndicator.STATISTICAL
+            else:
+                anomaly_tier = AnomalyTierIndicator.ML
+
         # ----------------------------------------------------------------------
         # 6. Window Ingestion (Regime Adaptation)
         # ----------------------------------------------------------------------
@@ -197,4 +242,4 @@ class RollingZScoreDetector:
 
         self.tick_counters[ticker] += 1
 
-        return bool(is_anomaly), float(z_price), float(ml_scored_sample)
+        return is_anomaly, float(z_price), float(ml_scored_sample), anomaly_tier
