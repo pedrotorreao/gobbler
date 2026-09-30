@@ -51,23 +51,25 @@ Gobbler is a high-throughput, distributed market surveillance and streaming anal
 ## Repository Structure
 
 ```text
+├── AGENTS.md                    # Agent persona rules (Socratic coding tutor)
 ├── consumer/
-│   ├── .venv/               # Isolated Python virtual environment (uv-managed, git-ignored)
-│   ├── consumer.py          # Kafka consumer worker: dedup, inference loop, manual commits
-│   ├── detector.py          # Two-tier anomaly detector: Z-Score (Tier 1) + IsolationForest (Tier 2)
-│   └── requirements.txt     # Python dependencies (confluent-kafka, redis, numpy, scikit-learn)
-├── docker-compose.yml       # Redpanda & Valkey container service definitions
+│   ├── .venv/                   # Isolated Python virtual environment (uv-managed, git-ignored)
+│   ├── consumer.py              # Kafka consumer worker: dedup, inference loop, manual commits
+│   ├── detector.py              # Two-tier anomaly detector: Z-Score (Tier 1) + IsolationForest (Tier 2)
+│   └── requirements.txt         # Python dependencies (confluent-kafka, redis, numpy, scikit-learn)
+├── docker-compose.yml           # Redpanda & Valkey container service definitions
+├── docs/
+│   ├── context.md               # Continuous architecture state for pair-programming agents
+│   ├── mlinferencing.md         # Study guide: rolling windows, Z-score, IsolationForest math
+│   ├── plan.md                  # Interactive project roadmap, milestones & definitions of done
+│   ├── redpanda.md              # Deep-dive architecture reference & CLI guide for Redpanda
+│   └── valkey.md                # Valkey concepts, Idempotent Consumer pattern & CLI guide
 ├── generator/
-│   └── generator.go         # Standalone synthetic market load generator (10 B3 assets)
-├── go.mod                   # Go module definitions
-├── go.sum                   # Checksums for external dependencies
-├── main.go                  # Core Ingestion Gateway, TCP server & Kafka producer
-├── plan01.md                # Interactive project roadmap, milestones & definitions of done
-├── context.md               # Continuous architecture state for pair-programming agents
-├── mlinferencing.md         # Study guide: rolling windows, Z-score, IsolationForest math
-├── redpanda.md              # Deep-dive architecture reference & CLI guide for Redpanda
-├── valkey.md                # Valkey concepts, Idempotent Consumer pattern & CLI guide
-└── README.md                # Project documentation
+│   └── generator.go             # Standalone synthetic market load generator (10 B3 assets)
+├── go.mod                       # Go module definitions
+├── go.sum                       # Checksums for external dependencies
+├── main.go                      # Core Ingestion Gateway, TCP server & Kafka producer
+└── README.md                    # Project documentation
 ```
 
 ---
@@ -88,10 +90,16 @@ Verify cluster health:
 docker exec redpanda rpk cluster info
 ```
 
-### 3. Create Partitioned Market Topic
-Create the `market-ticks` topic with 4 partitions:
+### 3. Create Partitioned Topics
+Create the `market-ticks` ingest topic and the `market-anomalies` alert topic, both with 4 partitions.
+Matching partition counts lets a downstream consumer group mirror the upstream worker topology:
 ```bash
 docker exec redpanda rpk topic create market-ticks --partitions 4
+docker exec redpanda rpk topic create market-anomalies --partitions 4
+```
+Verify both topics were created:
+```bash
+docker exec redpanda rpk topic list
 ```
 
 ### 4. Run the Ingestion Gateway
@@ -131,11 +139,33 @@ uv pip install -r requirements.txt
 ```bash
 PYTHONUNBUFFERED=1 .venv/bin/python consumer.py
 ```
-The worker subscribes to `market-ticks`, deduplicates via Valkey, and emits anomaly alerts:
+The worker subscribes to `market-ticks`, deduplicates via Valkey, and emits anomaly events:
 ```text
 [STARTUP] Consumer subscribed to 'market-ticks' topic.
 Received: Ticker=PETR4, Price=38.45, Timestamp=...
 [ANOMALY ALERT] PETR4 @ $32.68 (Vol: 7400, Z-Score: -3.82, ML-Score: -0.891)
+```
+
+### 9. Monitor the Anomaly Alert Stream
+In a fifth terminal, consume the `market-anomalies` topic to see confirmed anomaly events in real time:
+```bash
+docker exec -it redpanda rpk topic consume market-anomalies
+```
+Each event is a JSON payload keyed by asset ticker (ensuring per-ticker FIFO ordering):
+```json
+{
+  "ticker": "PETR4",
+  "price": 32.68,
+  "volume": 7400,
+  "timestamp_ns": 1726987234512345678,
+  "z_score": -3.82,
+  "ml_score": -0.891,
+  "anomaly_tier": "BOTH"
+}
+```
+Inspect partition-level watermarks to verify events are keyed and routed correctly:
+```bash
+docker exec redpanda rpk topic describe -p market-anomalies
 ```
 
 ---

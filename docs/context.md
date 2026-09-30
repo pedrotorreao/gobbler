@@ -51,10 +51,18 @@ Gobbler is a distributed real-time financial market surveillance and anomaly det
 4. **Stream Inference & Anomaly Detection (Step 4 - Complete)**:
    * Built [`consumer/detector.py`](file:///home/pedrotorreao/Documents/Projects/gobbler/consumer/detector.py): `RollingZScoreDetector` maintaining a 2D circular buffer `deque[tuple[float, int]]` storing `(price, volume)` per ticker.
    * **Tier 1 (Statistical)**: Dual-Condition Guard — `|z_price| > 3.0` AND `pct_change >= 2.0%` — guards against the micro-volatility trap (zero-std false positives).
-   * **Tier 2 (ML)**: `sklearn.ensemble.IsolationForest(n_estimators=50, contamination=0.02, random_state=42)`, fitted after 100-tick warm-up on normalized features `[z_price, z_volume]` and re-fitted every `refit_interval=100` ticks.
+   * **Tier 2 (ML)**: `sklearn.ensemble.IsolationForest(n_estimators=50, contamination=0.02, random_state=42)`, fitted on normalized features `[z_price, z_volume]` and re-fitted every `refit_interval=100` ticks.
+   * **ML Score Delay**: Both fitting and scoring deferred until `tick_counters[ticker] >= ml_score_delay` (default 500). IsolationForest is stateless — each `.fit()` discards the previous model. Early fits on the narrow cold-start window produce poorly-calibrated boundaries. Delaying both fit and score to tick 500 ensures the first trusted model is trained on a regime-stable distribution. During delay: `ml_score = 0.0`, Tier 1 only.
    * **Feature normalization**: Raw `[price, volume]` replaced by `[(price - μ_P)/σ_P, (volume - μ_V)/σ_V]` before `.fit()` and `.score_samples()`, centering the normal cluster at $(0, 0)$ and equalizing axis variance.
    * **Detection logic**: `is_anomaly = tier1_anomaly or (ml_scored_sample < -0.65)` — independent OR-logic; either tier can trigger. Uses `score_samples` threshold instead of `predict` to avoid the Contamination Trap.
    * **Diagnosed and resolved false-positive alert storm**: Root cause was training `IsolationForest` on raw `[price, volume]` and using `predict == -1` as the anomaly gate, causing the outer 2% boundary of the normal distribution to constantly fire.
+5. **Anomaly Event Emission (Step 5 - Complete)**:
+   * `confluent_kafka.Producer` initialized alongside the consumer (`acks=1`, `message.send.max.retries=3`).
+   * Confirmed anomalies produce a structured JSON event to the `market-anomalies` topic, keyed by `ticker` to preserve per-ticker FIFO ordering across all 4 partitions.
+   * `anomaly_tier` field serialized as `AnomalyTierIndicator.name` (`'STATISTICAL'`, `'ML'`, or `'BOTH'`) for human-readable downstream consumption.
+   * `producer.poll(0)` called after each `produce()` to drain librdkafka delivery callbacks without blocking the consumer loop.
+   * `producer.flush()` in the `finally` block guarantees no buffered anomaly events are dropped on shutdown.
+   * End-to-end verified live: `market-anomalies` topic consumed, confirming correct JSON schema, partition routing by ticker key, and FIFO ordering.
 
 ---
 
@@ -74,6 +82,7 @@ Gobbler is a distributed real-time financial market surveillance and anomaly det
 | **ML Anomaly Tier** | **`IsolationForest.score_samples` threshold (`< -0.65`)** | `IsolationForest.predict` | `predict` with `contamination=0.02` guarantees 2% of any training window is labeled as anomaly, producing constant false positives on normal random-walk ticks (Contamination Trap). `score_samples` exposes the continuous path-length score for domain-calibrated thresholding. |
 | **ML Feature Space** | **Normalized `[z_price, z_volume]`** | Raw `[price, volume]` | Raw features have incompatible scales (price in cents, volume in hundreds). Volume dominates isolation tree splits. Z-score normalization centers the normal cluster at $(0,0)$ with unit variance on both axes, equalizing split probability and geometrically separating genuine outliers. |
 | **Anomaly Logic** | **Independent OR (`tier1 or ml_scored < -0.65`)** | AND cascade | AND logic gates Tier 2 behind Tier 1, making ML blind to volume-only anomalies (no significant price move). OR logic lets each tier detect its complementary failure mode independently. |
+| **ML Score Delay** | **Deferred fit+score (`ml_score_delay=500`)** | Fit from tick 100, score immediately | `IsolationForest` is stateless: each `.fit()` discards the previous model. The first 100-tick window has a narrow, unrepresentative distribution producing borderline false positives. Delaying both fit and score to tick 500 (5 × `refit_interval`) ensures the first trusted model is regime-stable. Delaying both (not just scoring) avoids wasted CPU on throwaway fits. |
 
 ---
 
@@ -85,7 +94,17 @@ Gobbler is a distributed real-time financial market surveillance and anomaly det
 * **Redpanda Admin Port**: `localhost:9644`
 * **Valkey Port**: `localhost:6379`
 * **Target Topic**: `market-ticks` (Pre-created with **4 partitions**)
+* **Anomaly Topic**: `market-anomalies` (Pre-created with **4 partitions**, keyed by ticker)
 * **Consumer Group ID**: `gobbler-ml-consumers`
+* **Gateway Buffer Capacity**: `50,000` payloads (`jobQueue`)
+* **Detector Parameters**:
+  * `window_size=100` ticks (circular buffer per ticker)
+  * `min_observations=20` ticks (Tier 1 cold-start guard)
+  * `z_threshold=3.0` (Tier 1 outlier threshold)
+  * `min_pct_change=0.02` (Tier 1 material-move guard)
+  * `refit_interval=100` ticks (Tier 2 periodic re-fit cadence)
+  * `ml_score_delay=500` ticks (Tier 2 deferred activation threshold)
+  * `ml_score_threshold=-0.65` (Tier 2 isolated-outlier boundary)
 * **Gateway Buffer Capacity**: `50,000` payloads (`jobQueue`)
 * **Producer Batching Tuning**:
   * `BatchSize: 100` messages
@@ -100,23 +119,25 @@ Gobbler is a distributed real-time financial market surveillance and anomaly det
 ## 5. Current File Map
 
 ```text
-├── .vscode/
-│   └── settings.json        # Python interpreter and analysis paths for consumer/.venv
+├── AGENTS.md                    # Agent persona rules (Socratic coding tutor)
 ├── consumer/
-│   ├── .venv/               # Isolated virtual environment (ignored in git)
-│   ├── consumer.py          # Stateless Python consumer with Valkey idempotency
-│   └── requirements.txt     # Python dependencies (confluent-kafka, redis, numpy, scikit-learn)
-├── docker-compose.yml       # Redpanda & Valkey container service definitions
+│   ├── .venv/                   # Isolated virtual environment (git-ignored)
+│   ├── consumer.py              # Kafka consumer: dedup, inference loop, anomaly producer, manual commits
+│   ├── detector.py              # RollingZScoreDetector: two-tier Z-Score + IsolationForest
+│   └── requirements.txt         # Python dependencies (confluent-kafka, redis, numpy, scikit-learn)
+├── docker-compose.yml           # Redpanda & Valkey container service definitions
+├── docs/
+│   ├── context.md               # Continuous architecture state (this file)
+│   ├── mlinferencing.md         # Study guide: rolling windows, Z-score, IsolationForest math
+│   ├── plan.md                  # Project roadmap & progress tracker
+│   ├── redpanda.md              # Redpanda concepts, CLI guide & architecture reference
+│   └── valkey.md                # Valkey concepts, Idempotent Consumer & CLI guide
 ├── generator/
-│   └── generator.go         # Package main - standalone exchange simulator (10 B3 assets)
-├── go.mod                   # Module github.com/pedrotorreao/gobbler
-├── go.sum                   # Dependency checksums
-├── main.go                  # Package main - Ingestion Gateway, pprof & Kafka producer
-├── plan01.md                # Project roadmap & progress tracker
-├── context.md               # Continuous architecture state (this file)
-├── redpanda.md              # Redpanda concepts, CLI guide & architecture reference
-├── valkey.md                # Valkey concepts, Idempotent Consumer & CLI guide
-└── README.md                # Public project overview & quickstart
+│   └── generator.go             # Package main - standalone exchange simulator (10 B3 assets)
+├── go.mod                       # Module github.com/pedrotorreao/gobbler
+├── go.sum                       # Dependency checksums
+├── main.go                      # Package main - Ingestion Gateway, pprof & Kafka producer
+└── README.md                    # Public project overview & quickstart
 ```
 
 ---
@@ -126,5 +147,6 @@ Gobbler is a distributed real-time financial market surveillance and anomaly det
 * [x] **Step 1**: Spin up **Valkey** in [`docker-compose.yml`](file:///home/pedrotorreao/Documents/Projects/gobbler/docker-compose.yml) (Port `6379`).
 * [x] **Step 2**: Build stateless Python consumer using consumer groups ([`consumer/consumer.py`](file:///home/pedrotorreao/Documents/Projects/gobbler/consumer/consumer.py)).
 * [x] **Step 3**: Implement **Idempotent Consumer pattern** with Valkey atomic `SETNX` (with 60s TTL).
-* [x] **Step 4**: Build the stream inference layer in [`consumer/detector.py`](file:///home/pedrotorreao/Documents/Projects/gobbler/consumer/detector.py): Two-tier hybrid detector with rolling Z-score (Tier 1) and `IsolationForest` on normalized `[z_price, z_volume]` features (Tier 2). Independent OR-logic with `score_samples < -0.65` threshold.
-* [ ] **Step 5 (Immediate Next Task)**: Emit detected anomalies to a dedicated `market-anomalies` Kafka topic for downstream notification and audit logging.
+* [x] **Step 4**: Build the stream inference layer in [`consumer/detector.py`](file:///home/pedrotorreao/Documents/Projects/gobbler/consumer/detector.py): Two-tier hybrid detector with rolling Z-score (Tier 1) and `IsolationForest` on normalized `[z_price, z_volume]` features (Tier 2). Independent OR-logic with `score_samples < -0.65` threshold. ML activation deferred to tick 500 via `ml_score_delay`.
+* [x] **Step 5**: Emit detected anomalies to a dedicated `market-anomalies` Kafka topic. Keyed by ticker, full JSON payload with `anomaly_tier` name. Producer lifecycle (init, `poll(0)`, `flush()`) fully wired into the consumer event loop. End-to-end verified.
+* **Phase 3 Status**: ✅ COMPLETED — Next: Phase 4 (QuestDB persistence).

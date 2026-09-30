@@ -68,12 +68,19 @@ Infrastructure-as-Code.
   - **Tier 1 (Statistical)**: Rolling Z-score with a Dual-Condition Guard (`|Z| > 3.0` AND `pct_change >= 2%`) against the micro-volatility trap.
   - **Tier 2 (ML)**: `IsolationForest` fitted on normalized `[z_price, z_volume]` features from the rolling window, re-fitted every 100 ticks. Uses `score_samples` with a calibrated threshold (`< -0.65`) instead of `predict` to avoid the Contamination Trap.
   - **Detection Logic**: Independent OR — either tier independently triggers an alert, covering both univariate price shocks and multivariate co-movement anomalies (e.g., volume-only spikes).
-- [ ] **Step 5: 🎯 NEXT STEP** — Emit detected anomalies to a separate `market-anomalies` Kafka topic for downstream notification.
+  - **ML Score Delay** (`ml_score_delay=500`): IsolationForest fitting and scoring are both deferred until 500 ticks have been observed per ticker. Since each `.fit()` call is stateless (no memory across fits), early fits during the cold-start window would be throwaway fits producing poorly-calibrated boundaries. Deferring both saves CPU and ensures the first trusted score comes from a regime-stable distribution.
+- [x] **Step 5:** Emit detected anomalies to a separate `market-anomalies` Kafka topic for downstream notification.
+  - Confirmed `confluent_kafka.Producer` initialized with `acks=1` and `message.send.max.retries=3`.
+  - Anomaly JSON payload keyed by `ticker` (preserving per-ticker FIFO ordering on `market-anomalies`).
+  - `anomaly_tier` serialized as string name (`'STATISTICAL'`, `'ML'`, `'BOTH'`) via `AnomalyTierIndicator.name`.
+  - `producer.poll(0)` called after each `produce()` to drain librdkafka's delivery callback queue.
+  - `producer.flush()` called in the `finally` block after `consumer.close()` to guarantee no buffered events are dropped on shutdown.
+  - End-to-end verified: `market-anomalies` topic consumed live, confirming correct JSON schema, ticker key routing to correct partition, and FIFO ordering.
 
 **Definition of Done (DoD):**
 - [x] Injected duplicate messages are recognized and dropped by the Valkey cache check.
 - [x] The Python worker computes sliding-window statistics over streaming data with sub-15ms inference latency.
-- [ ] Simulated anomalies consistently trigger downstream alerts to the dedicated anomaly topic.
+- [x] Simulated anomalies consistently trigger downstream alerts to the dedicated `market-anomalies` topic (end-to-end verified).
 
 ---
 
@@ -129,5 +136,6 @@ Infrastructure-as-Code.
 | Write stateless Python consumer with Consumer Groups | Week 7-8 | [x] Completed |
 | Implement Idempotent Consumer (Valkey SETNX deduplication) | Week 8 | [x] Completed |
 | Build Two-Tier anomaly detector (`detector.py`: Z-Score + IsolationForest) | Week 8-9 | [x] Completed |
-| **Emit anomalies to `market-anomalies` Kafka topic** | **Week 9** | **🎯 NEXT STEP** |
+| Emit anomalies to `market-anomalies` Kafka topic | Week 9 | [x] Completed |
+| Refine ML reliability: `ml_score_delay=500` deferred fitting to avoid early boundary instability | Week 9 | [x] Completed |
 

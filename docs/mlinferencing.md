@@ -175,6 +175,15 @@ flowchart TD
 4. **Periodic Re-Fitting (Regime Adaptation)**:
    The model re-trains from the rolling window every `refit_interval=100` ticks, keeping the feature space aligned with the current market regime.
 
+5. **ML Score Delay (`ml_score_delay=500` ticks per ticker)**:
+   A key reliability insight: `IsolationForest` is a **stateless batch learner** — each `.fit()` call discards the previous model entirely and builds a new ensemble from scratch. The first 100-tick window is statistically narrow, and isolation boundaries trained on it are poorly calibrated, producing borderline false positives around the `-0.65` threshold.
+
+   **Solution**: Defer both fitting and scoring until `tick_counters[ticker] >= ml_score_delay` (default 500). This ensures the first model is trained on a 100-tick window drawn from a **regime-stable** distribution, not from the cold-start warm-up phase.
+
+   * During ticks 0–499: **Tier 1 only** (Z-score guard). Tier 2 is silent.
+   * From tick 500 onwards: Both tiers are active.
+   * Note: Delaying the fit (not just the score) is correct — since each fit is stateless, early throwaway fits at ticks 100–499 produce no usable model at tick 500. Delaying both saves CPU and produces identical model quality at activation.
+
 ---
 
 ## 5. Efficient Data Structures: Why `collections.deque`?
@@ -195,7 +204,8 @@ Using `collections.deque(maxlen=100)` gives us an in-memory circular buffer with
 
 1. **The Cold Start Problem**:
    When the consumer first starts, the deque has 1, 2, or 5 ticks. With fewer than ~10 ticks, standard deviation is meaningless.
-   * *Rule*: Do not score Z-scores until the window contains at least $N_{\text{min}}$ ticks (e.g., 20 ticks). The ML layer requires a stricter warm-up of at least 100 ticks before the first `.fit()` call.
+   * *Tier 1 rule*: Do not score Z-scores until the window contains at least $N_{\text{min}}$ ticks (e.g., `min_observations=20`). Returns `(False, 0.0, 0.0, NONE)` immediately.
+   * *Tier 2 rule*: Do not fit or score the IsolationForest until `tick_counters[ticker] >= ml_score_delay` (default 500 ticks). This ensures the ML model's first training window is drawn from a regime-stable distribution. During the delay, `ml_score = 0.0` and only Tier 1 is active.
 2. **Zero Volatility ($\sigma = 0$)**:
    If a stock is halted or illiquid, 50 consecutive ticks might have the exact same price ($\$10.00$). The standard deviation is $0$.
    * *Price guard*: Floor `std_price_effective = max(σ_price, 0.01)` to prevent `ZeroDivisionError`.
