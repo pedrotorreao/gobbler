@@ -20,3 +20,14 @@ services:
     ports:
       - "6379:6379" # Default Valkey/Redis port
     command: [ "valkey-server", "--save", "" ] # Optional: disables background RDB disk snapshots for pure in-memory ephemeral speed
+
+  questdb:
+    image: questdb/questdb:latest
+    container_name: questdb
+    ports:
+      - "9000:9000" # Web Console, REST API & HTTP ILP (/write)
+      - "9009:9009" # InfluxDB Line Protocol (ILP) over TCP
+      - "8812:8812" # PostgreSQL Wire Protocol
+    environment:
+      - QDB_TELEMETRY_ENABLED=false # Disables telemetry reporting for minimal overhead
+    # Notice: NO volumes declared -> 100% ephemeral!
