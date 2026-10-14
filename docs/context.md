@@ -11,6 +11,8 @@ Gobbler is a distributed real-time financial market surveillance and anomaly det
 * **Tech Stack**: Go 1.22+, Docker & Docker Compose, Redpanda (Kafka API), Python (NumPy/Scikit-learn - Phase 3), Valkey (Phase 3), QuestDB (Phase 4), Kind/OpenTofu (Phase 4).
 * **Roadmap Reference**: [`plan.md`](file:///home/pedrotorreao/Documents/Projects/gobbler/docs/plan.md)
 * **Redpanda Deep Dive**: [`redpanda.md`](file:///home/pedrotorreao/Documents/Projects/gobbler/docs/redpanda.md)
+* **Valkey Deep Dive**: [`valkey.md`](file:///home/pedrotorreao/Documents/Projects/gobbler/docs/valkey.md)
+* **QuestDB Deep Dive**: [`questdb.md`](file:///home/pedrotorreao/Documents/Projects/gobbler/docs/questdb.md)
 
 ---
 
@@ -64,6 +66,17 @@ Gobbler is a distributed real-time financial market surveillance and anomaly det
    * `producer.flush()` in the `finally` block guarantees no buffered anomaly events are dropped on shutdown.
    * End-to-end verified live: `market-anomalies` topic consumed, confirming correct JSON schema, partition routing by ticker key, and FIFO ordering.
 
+### Phase 4: Time-Series Persistence & Infrastructure-as-Code (🚀 IN PROGRESS)
+1. **QuestDB Ingestion Infrastructure (Step 1 - Complete)**: Added `questdb/questdb:latest` to [`docker-compose.yml`](file:///home/pedrotorreao/Documents/Projects/gobbler/docker-compose.yml) exposing port `9000` (Web Console, REST, HTTP ILP), `9009` (TCP ILP), and `8812` (PGWire). Pre-created partitioned tables `market_ticks` and `market_anomalies` (`PARTITION BY DAY`) with symbol caching (`CAPACITY 16 CACHE`), and verified ILP HTTP writes and `ASOF JOIN` queries.
+2. **Go Persistence Worker (Step 2 - Built & Documented)**:
+   * Built dedicated streaming worker in [`persister/persister.go`](file:///home/pedrotorreao/Documents/Projects/gobbler/persister/persister.go).
+   * Separate consumer groups: `gobbler-ticks-persister-group` and `gobbler-anomalies-persister-group` with `StartOffset: kafka.FirstOffset`.
+   * High-performance ILP formatting via `strconv.Append*` and slice buffer reuse.
+   * Dual-trigger batching engine (`batchSize=5000` or `flushInterval=500ms`).
+   * HTTP POST flushes to QuestDB `/write` endpoint with Keep-Alive connection pooling.
+   * Multi-partition offset commits (`reader.CommitMessages(ctx, batchKafkaMessages...)`) executed only post-flush acknowledgment (HTTP 204/200).
+   * Clean shutdown lifecycle handling draining in-flight buffers under a 3-second bounded context timeout.
+
 ---
 
 ## 3. Core Problems Solved & Architectural Rationale
@@ -83,6 +96,11 @@ Gobbler is a distributed real-time financial market surveillance and anomaly det
 | **ML Feature Space** | **Normalized `[z_price, z_volume]`** | Raw `[price, volume]` | Raw features have incompatible scales (price in cents, volume in hundreds). Volume dominates isolation tree splits. Z-score normalization centers the normal cluster at $(0,0)$ with unit variance on both axes, equalizing split probability and geometrically separating genuine outliers. |
 | **Anomaly Logic** | **Independent OR (`tier1 or ml_scored < -0.65`)** | AND cascade | AND logic gates Tier 2 behind Tier 1, making ML blind to volume-only anomalies (no significant price move). OR logic lets each tier detect its complementary failure mode independently. |
 | **ML Score Delay** | **Deferred fit+score (`ml_score_delay=500`)** | Fit from tick 100, score immediately | `IsolationForest` is stateless: each `.fit()` discards the previous model. The first 100-tick window has a narrow, unrepresentative distribution producing borderline false positives. Delaying both fit and score to tick 500 (5 × `refit_interval`) ensures the first trusted model is regime-stable. Delaying both (not just scoring) avoids wasted CPU on throwaway fits. |
+| **Persistence Protocol** | **InfluxDB Line Protocol (ILP over HTTP/TCP)** | PostgreSQL Wire (PGWire) | ILP bypasses SQL parsing, query planning, and transactional locking, appending directly to column memory buffers with zero-copy symbol interning. At 50,000+ msgs/sec, ILP scales to millions of rows/sec without CPU bottlenecks. |
+| **Persistence Architecture** | **Decoupled Go Service (`persister/`)** | Colocated inside Python ML Consumer | Isolates failure domains and prevents Head-of-Line blocking (slow DB writes stall ML inference). Lets CPU-heavy ML and I/O-heavy persistence scale independently. Uses Go for high-throughput zero-allocation batch assembly. |
+| **Storage Topology** | **Two Dedicated Tables (`market_ticks`, `market_anomalies`)** | Single Unified Table | Time-series databases are append-only (no row `UPDATE`). Dedicated tables keep tick ingestion at maximum append throughput, keep anomaly audit queries instantaneous without full table scans, and allow clean `ASOF JOIN` queries. |
+| **Table Partitioning** | **`PARTITION BY DAY`** | `PARTITION BY HOUR` | For local development and test runs, `BY DAY` bounds open file descriptors and directory sprawl. Under continuous 50k msgs/sec (~180M rows/hr), `BY HOUR` reaches 1-3GB partitions, aligning with QuestDB's 100MB-10GB partition sizing rule. |
+| **Persistence Batching** | **Dual-Trigger (`5,000` rows or `500ms`)** | Per-message streaming insert | Optimizes QuestDB ILP chunk sizes while bounding freshness latency to 500ms during quiet periods. Consumer offsets are committed only post-flush to guarantee at-least-once persistence. |
 
 ---
 
@@ -113,6 +131,12 @@ Gobbler is a distributed real-time financial market surveillance and anomaly det
   * `WriteTimeout: 2 * time.Second`
 * **Retry Parameters**: Initial backoff `50ms`, multiplier `2x`, max ceiling `1s`.
 * **Valkey Deduplication TTL**: `60` seconds (`EX 60`).
+* **QuestDB Web Console / REST / HTTP ILP Port**: `localhost:9000`
+* **QuestDB TCP ILP Port**: `localhost:9009`
+* **QuestDB PostgreSQL Wire Port**: `localhost:8812`
+* **QuestDB Target Tables**: `market_ticks` (`PARTITION BY DAY`), `market_anomalies` (`PARTITION BY DAY`)
+* **Persister Consumer Group ID**: `gobbler-persister-group`
+* **Persister Batch Tuning**: `MaxBatchSize: 5000` rows, `MaxFlushInterval: 500ms`
 
 ---
 
@@ -130,6 +154,7 @@ Gobbler is a distributed real-time financial market surveillance and anomaly det
 │   ├── context.md               # Continuous architecture state (this file)
 │   ├── mlinferencing.md         # Study guide: rolling windows, Z-score, IsolationForest math
 │   ├── plan.md                  # Project roadmap & progress tracker
+│   ├── questdb.md               # QuestDB concepts, ILP format, table partitioning & SQL reference
 │   ├── redpanda.md              # Redpanda concepts, CLI guide & architecture reference
 │   └── valkey.md                # Valkey concepts, Idempotent Consumer & CLI guide
 ├── generator/
@@ -137,16 +162,16 @@ Gobbler is a distributed real-time financial market surveillance and anomaly det
 ├── go.mod                       # Module github.com/pedrotorreao/gobbler
 ├── go.sum                       # Dependency checksums
 ├── main.go                      # Package main - Ingestion Gateway, pprof & Kafka producer
+├── persister/
+│   └── persister.go             # Package main - ILP persistence worker (Kafka -> QuestDB)
 └── README.md                    # Public project overview & quickstart
 ```
 
 ---
 
-## 6. Immediate Next Steps: Phase 3 (Stream Inference & Anomaly Detection)
+## 6. Immediate Next Steps: Phase 4 (Time-Series Persistence & Infrastructure-as-Code)
 
-* [x] **Step 1**: Spin up **Valkey** in [`docker-compose.yml`](file:///home/pedrotorreao/Documents/Projects/gobbler/docker-compose.yml) (Port `6379`).
-* [x] **Step 2**: Build stateless Python consumer using consumer groups ([`consumer/consumer.py`](file:///home/pedrotorreao/Documents/Projects/gobbler/consumer/consumer.py)).
-* [x] **Step 3**: Implement **Idempotent Consumer pattern** with Valkey atomic `SETNX` (with 60s TTL).
-* [x] **Step 4**: Build the stream inference layer in [`consumer/detector.py`](file:///home/pedrotorreao/Documents/Projects/gobbler/consumer/detector.py): Two-tier hybrid detector with rolling Z-score (Tier 1) and `IsolationForest` on normalized `[z_price, z_volume]` features (Tier 2). Independent OR-logic with `score_samples < -0.65` threshold. ML activation deferred to tick 500 via `ml_score_delay`.
-* [x] **Step 5**: Emit detected anomalies to a dedicated `market-anomalies` Kafka topic. Keyed by ticker, full JSON payload with `anomaly_tier` name. Producer lifecycle (init, `poll(0)`, `flush()`) fully wired into the consumer event loop. End-to-end verified.
-* **Phase 3 Status**: ✅ COMPLETED — Next: Phase 4 (QuestDB persistence).
+* [x] **Step 1**: Spin up **QuestDB** in [`docker-compose.yml`](file:///home/pedrotorreao/Documents/Projects/gobbler/docker-compose.yml) (Port `9000` Web/HTTP/ILP, Port `9009` TCP ILP, Port `8812` PGWire). Verified DDL table creation (`market_ticks`, `market_anomalies`), ILP HTTP ingestion (`204 OK`), and `ASOF JOIN` analytics.
+* [x] **Step 2**: Implement dedicated Go persistence service ([`persister/persister.go`](file:///home/pedrotorreao/Documents/Projects/gobbler/persister/persister.go)) subscribing to `market-ticks` and `market-anomalies`, formatting ILP batches (5,000 rows or 500ms), and streaming to QuestDB with post-flush offset commits.
+* [x] **Step 3**: Execute end-to-end live verification of full pipeline: Gateway -> Redpanda -> ML Worker (anomalies) -> Persister -> QuestDB tables. Verified: 69,966 ticks and 1,622 anomalies persisted across all 10 assets, with zero consumer group lag and verified ASOF JOIN analytics.
+* **Next Steps**: Step 3 (Multi-stage Dockerfiles for all microservices) and Step 4 (OpenTofu IaC).

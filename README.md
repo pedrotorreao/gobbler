@@ -57,11 +57,12 @@ Gobbler is a high-throughput, distributed market surveillance and streaming anal
 │   ├── consumer.py              # Kafka consumer worker: dedup, inference loop, manual commits
 │   ├── detector.py              # Two-tier anomaly detector: Z-Score (Tier 1) + IsolationForest (Tier 2)
 │   └── requirements.txt         # Python dependencies (confluent-kafka, redis, numpy, scikit-learn)
-├── docker-compose.yml           # Redpanda & Valkey container service definitions
+├── docker-compose.yml           # Redpanda, Valkey & QuestDB container service definitions
 ├── docs/
 │   ├── context.md               # Continuous architecture state for pair-programming agents
 │   ├── mlinferencing.md         # Study guide: rolling windows, Z-score, IsolationForest math
 │   ├── plan.md                  # Interactive project roadmap, milestones & definitions of done
+│   ├── questdb.md               # Deep-dive architecture reference, ILP guide & SQL reference for QuestDB
 │   ├── redpanda.md              # Deep-dive architecture reference & CLI guide for Redpanda
 │   └── valkey.md                # Valkey concepts, Idempotent Consumer pattern & CLI guide
 ├── generator/
@@ -69,6 +70,8 @@ Gobbler is a high-throughput, distributed market surveillance and streaming anal
 ├── go.mod                       # Go module definitions
 ├── go.sum                       # Checksums for external dependencies
 ├── main.go                      # Core Ingestion Gateway, TCP server & Kafka producer
+├── persister/
+│   └── persister.go             # High-throughput ILP persistence worker (Kafka -> QuestDB)
 └── README.md                    # Project documentation
 ```
 
@@ -166,6 +169,20 @@ Each event is a JSON payload keyed by asset ticker (ensuring per-ticker FIFO ord
 Inspect partition-level watermarks to verify events are keyed and routed correctly:
 ```bash
 docker exec redpanda rpk topic describe -p market-anomalies
+```
+
+### 10. Run the Time-Series Persistence Worker
+In a sixth terminal, start the Go persistence worker to batch streaming ticks and anomalies into QuestDB via InfluxDB Line Protocol:
+```bash
+go run ./persister/persister.go
+```
+Verify ingested rows and execute analytics in QuestDB Web Console (`http://localhost:9000`) or via REST:
+```bash
+# Query total persisted ticks
+curl -G "http://localhost:9000/exec" --data-urlencode "query=SELECT count(*) FROM market_ticks;"
+
+# Query anomaly alerts joined with prevailing market prices
+curl -G "http://localhost:9000/exec" --data-urlencode "query=SELECT a.timestamp, a.ticker, a.anomaly_tier, a.z_score, t.price FROM market_anomalies a ASOF JOIN market_ticks t ON (ticker);"
 ```
 
 ---

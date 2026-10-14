@@ -18,7 +18,13 @@ Infrastructure-as-Code.
        ├──► [Python ML Engine] ──► [Valkey Distributed Cache] (Idempotency)
        │           │ (Inference / Anomaly Alert)
        │           ▼
-       └─────► [QuestDB] ◄── (Time-Series Analytics)
+       │     (market-anomalies)
+       │           │
+       ▼           ▼
+[Go Persistence Service] ── (ILP Batching: 5k rows / 500ms)
+       │
+       ▼
+   [QuestDB] ◄── (Time-Series Storage & SQL Analytics)
                    ▲
 [Kind (K8s) / OpenTofu / Prometheus Observability Layer]
 ```
@@ -58,7 +64,7 @@ Infrastructure-as-Code.
 
 ---
 
-### Phase 3: Stream Inference, Anomaly Detection & Distributed Caching (Weeks 7–9) — 🚀 IN PROGRESS
+### Phase 3: Stream Inference, Anomaly Detection & Distributed Caching (Weeks 7–9) — ✅ COMPLETED
 *Implement real-time analytical workers, machine learning, and network reliability patterns.*
 
 - [x] **Step 1:** Spin up Valkey in a local Docker container (`docker-compose.yml`).
@@ -84,17 +90,17 @@ Infrastructure-as-Code.
 
 ---
 
-### Phase 4: Time-Series Persistence & Infrastructure-as-Code (Weeks 10–12) — ⏳ PENDING
+### Phase 4: Time-Series Persistence & Infrastructure-as-Code (Weeks 10–12) — 🚀 IN PROGRESS
 *Automate environment setup and configure high-throughput analytical storage.*
 
-- [ ] **Step 1:** Deploy QuestDB using Docker and expose its InfluxDB Line Protocol (ILP) or PostgreSQL wire ingestion interface.
-- [ ] **Step 2:** Write a persistence service to ingest raw tick data and anomaly alerts from Kafka into partitioned QuestDB tables.
+- [x] **Step 1:** Deploy QuestDB using Docker (`docker-compose.yml`) exposing InfluxDB Line Protocol (HTTP `:9000` & TCP `:9009`), PostgreSQL wire (`:8812`), and Web Console (`:9000`). Verified DDL table creation (`market_ticks`, `market_anomalies`), ILP HTTP ingestion (`204 OK`), and ASOF JOIN queries.
+- [x] **Step 2:** Write a dedicated Go persistence service ([`persister/persister.go`](file:///home/pedrotorreao/Documents/Projects/gobbler/persister/persister.go)) to ingest raw tick data (`market-ticks`) and anomaly alerts (`market-anomalies`) from Kafka into dedicated partitioned QuestDB tables (`market_ticks` and `market_anomalies`) via InfluxDB Line Protocol (ILP) with a dual-trigger batching strategy (5,000 rows or 500ms).
 - [ ] **Step 3:** Package every custom microservice (Ingest Gateway, Mock Generator, ML Worker, Persistence Worker) using multi-stage, minimal-footprint Dockerfiles.
 - [ ] **Step 4:** Write OpenTofu scripts to declaratively provision local containers, storage volumes, and network bridges.
 - [ ] **Step 5:** Create local Kubernetes (Kind) manifests declaring Deployments, Services, ConfigMaps, and Horizontal Pod Autoscalers (HPA) for the Python consumer tier.
 
 **Definition of Done (DoD):**
-- [ ] Financial tick data and anomaly records are persistently queryable in QuestDB via SQL.
+- [x] Financial tick data and anomaly records are persistently queryable in QuestDB via SQL. (Verified live: 69,966 ticks and 1,622 anomalies ingested via ILP and queried via ASOF JOIN).
 - [ ] Running a single `tofu apply` command spins up the required auxiliary infrastructure from a clean state.
 - [ ] The Python inference worker tier scales pod replicas up and down inside Kind based on Kafka consumer lag.
 
@@ -138,4 +144,7 @@ Infrastructure-as-Code.
 | Build Two-Tier anomaly detector (`detector.py`: Z-Score + IsolationForest) | Week 8-9 | [x] Completed |
 | Emit anomalies to `market-anomalies` Kafka topic | Week 9 | [x] Completed |
 | Refine ML reliability: `ml_score_delay=500` deferred fitting to avoid early boundary instability | Week 9 | [x] Completed |
+| Spin up local QuestDB container (Docker Compose) | Week 10 | [x] Completed |
+| Build Go ILP persistence worker (`persister/`) with dual-trigger batching | Week 10-11 | [x] Completed |
+| End-to-end verification of Phase 4 pipeline (Kafka -> Persister -> QuestDB) | Week 11 | [x] Completed |
 
