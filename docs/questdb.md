@@ -210,7 +210,7 @@ ASOF JOIN market_ticks t ON (ticker);
 
 ## 6. Docker Compose Service Definition
 
-In [`docker-compose.yml`](file:///home/pedrotorreao/Documents/Projects/gobbler/docker-compose.yml):
+In [`docker-compose.yml`](../docker-compose.yml):
 
 ```yaml
   questdb:

@@ -61,7 +61,7 @@ func main() {
 	// Independent consumer groups ensure high-throughput ticks (~50k msgs/sec)
 	// and sparse anomaly alerts (~10 msgs/sec) scale, commit, and rebalance independently.
 	ticksReader := kafka.NewReader(kafka.ReaderConfig{
-		Brokers:     []string{"localhost:9092"},
+		Brokers:     []string{getEnv("KAFKA_BROKER", "localhost:9092")},
 		Topic:       "market-ticks",
 		GroupID:     "gobbler-ticks-persister-group",
 		MinBytes:    1000,
@@ -69,7 +69,7 @@ func main() {
 		StartOffset: kafka.FirstOffset, // Replay from beginning if no prior group commit exists
 	})
 	anomaliesReader := kafka.NewReader(kafka.ReaderConfig{
-		Brokers:     []string{"localhost:9092"},
+		Brokers:     []string{getEnv("KAFKA_BROKER", "localhost:9092")},
 		Topic:       "market-anomalies",
 		GroupID:     "gobbler-anomalies-persister-group",
 		MinBytes:    1000,
@@ -191,7 +191,7 @@ func parseMarketAnomalyFromKafkaMsgToILP(msg kafka.Message, anomDataBuf []byte) 
 // to QuestDB's '/write' endpoint. It verifies receipt via HTTP 204 No Content (or 200 OK)
 // and drains the response body to allow TCP connection pooling.
 func flushToQuestDB(ctx context.Context, client *http.Client, payload []byte) error {
-	const questDBUrl = "http://localhost:9000/write"
+	var questDBUrl = getEnv("QUESTDB_URL", "http://localhost:9000/write")
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, questDBUrl, bytes.NewBuffer(payload))
 	if err != nil {
@@ -304,4 +304,11 @@ func runPersistenceWorker(ctx context.Context, reader *kafka.Reader, parser ILPP
 			startTime = time.Now()
 		}
 	}
+}
+
+func getEnv(key, fallback string) string {
+	if value := os.Getenv(key); value != "" {
+		return value
+	}
+	return fallback
 }
