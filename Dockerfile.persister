@@ -1,0 +1,75 @@
+# ==============================================================================
+# Gobbler Time-Series Persistence Worker Dockerfile
+#
+# Architecture: Multi-Stage Build (Alpine Builder -> Scratch Runtime)
+# Service Type: Streaming Ingestion Worker (Redpanda Kafka -> QuestDB ILP over HTTP)
+# Ports:        None (Pure consumer and outbound HTTP database client)
+# Security:     Non-Root (UID 10001), 100% Static Linking, Zero Attack Surface
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# Stage 1: Build Environment
+# ------------------------------------------------------------------------------
+# FROM <image>[:<tag>] [AS <name>]
+# Initializes the 'builder' compilation stage using Alpine Linux with Go 1.25.
+FROM golang:1.25-alpine AS builder
+
+# WORKDIR <path>
+# Establishes /build as the root workspace directory for all subsequent build commands.
+WORKDIR /build
+
+# RUN <command>
+# Adds an unprivileged system user 'appuser' (UID 10001) without a password (-D).
+# Generated in the builder stage to export /etc/passwd into the final scratch image.
+RUN adduser -D -u 10001 appuser
+
+# COPY [--chown=<user>:<group>] <src>... <dest>
+# Copies Go module manifests (go.mod, go.sum) into /build to optimize layer caching.
+COPY go.mod go.sum ./
+
+# RUN <command>
+# Pre-downloads Go modules into the builder image cache ($GOPATH/pkg/mod).
+RUN go mod download
+
+# COPY <src>... <dest>
+# Copies the project repository files into the builder container.
+COPY . .
+
+# RUN <command>
+# Compiles the persistence worker service into a static Linux binary:
+#   CGO_ENABLED=0: Compiles pure Go code without dynamic C library bindings (libc/musl).
+#   GOOS=linux:    Cross-compiles targeting the Linux operating system kernel.
+#   -ldflags:      Strips symbol tables (-s) and DWARF debug data (-w) for minimal size (~7.7MB).
+#   -o /bin/persister: Specifies output binary location.
+#   ./persister/persister.go: Main package source file for the ILP persistence worker.
+RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /bin/persister ./persister/persister.go
+
+# ------------------------------------------------------------------------------
+# Stage 2: Minimal Runtime Environment
+# ------------------------------------------------------------------------------
+# FROM scratch
+# Deploys on Docker's zero-byte empty base image for maximal isolation and zero attack surface.
+FROM scratch
+
+# COPY --from=<stage> <src> <dest>
+# 1. /etc/passwd: Needed for OS-level resolution of the unprivileged 'appuser' account.
+COPY --from=builder /etc/passwd /etc/passwd
+
+# 2. /etc/ssl/certs/ca-certificates.crt: Required by Go's crypto/x509 standard library for outbound HTTPS calls.
+COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+
+# 3. /bin/persister: Copies the static compiled executable into the root directory.
+COPY --from=builder /bin/persister /persister
+
+# USER <user>
+# Enforces non-root execution (UID 10001) to protect the host kernel.
+USER appuser
+
+# Note on EXPOSE:
+# The persister is a pure streaming consumer that polls Kafka (KAFKA_BROKER) and flushes
+# ILP batches to QuestDB (QUESTDB_URL). It has no inbound listening ports, so no EXPOSE is needed.
+
+# ENTRYPOINT ["executable"]
+# JSON exec-form syntax: runs /persister directly as PID 1 to receive SIGTERM/SIGINT signals
+# for graceful buffer flushing and consumer offset commits.
+ENTRYPOINT ["/persister"]

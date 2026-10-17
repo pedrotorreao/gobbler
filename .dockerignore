@@ -1,0 +1,7 @@
+consumer/.venv/
+**/__pycache__/
+docs/
+.vscode/
+.git/
+*.pyc
+*.log

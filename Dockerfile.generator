@@ -1,0 +1,78 @@
+# ==============================================================================
+# Gobbler Synthetic Exchange Generator Dockerfile
+#
+# Architecture: Multi-Stage Build (Alpine Builder -> Scratch Runtime)
+# Service Type: Standalone Load Generator & High-Frequency Order Flow Simulator
+# Ports:        None (Pure outbound TCP dialer to the Ingestion Gateway)
+# Security:     Non-Root (UID 10001), 100% Static Linking, Zero Attack Surface
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# Stage 1: Build Environment
+# ------------------------------------------------------------------------------
+# FROM <image>[:<tag>] [AS <name>]
+# Initializes a new build stage named 'builder' using Go 1.25 on Alpine Linux.
+# Provides the minimal official Go compilation toolchain to generate static Linux binaries.
+FROM golang:1.25-alpine AS builder
+
+# WORKDIR <path>
+# Designates /build as the root workspace inside the builder for subsequent commands.
+WORKDIR /build
+
+# RUN <command>
+# Generates an unprivileged system user 'appuser' with:
+#   -D:       Disable password creation.
+#   -u 10001: Explicitly assign non-root UID 10001 for least-privilege container execution.
+RUN adduser -D -u 10001 appuser
+
+# COPY [--chown=<user>:<group>] <src>... <dest>
+# Copies Go dependency manifests into the container before copying the entire codebase.
+COPY go.mod go.sum ./
+
+# RUN <command>
+# Pre-fetches Go modules. Thanks to Docker layer caching, this layer is preserved across builds
+# as long as go.mod and go.sum are unmodified.
+RUN go mod download
+
+# COPY <src>... <dest>
+# Copies all repository files into /build (respecting .dockerignore filtering).
+COPY . .
+
+# RUN <command>
+# Compiles the synthetic market data generator executable:
+#   CGO_ENABLED=0: Disables cgo, producing a portable, statically linked ELF binary with zero libc dependencies.
+#   GOOS=linux:    Targets the Linux OS architecture for container runtime compatibility.
+#   -ldflags:      Passes linker arguments (-s: omit symbol table, -w: omit DWARF debug info).
+#   -o /bin/generator: Target executable destination.
+#   ./generator/generator.go: Path to the generator main package entrypoint.
+RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /bin/generator ./generator/generator.go
+
+# ------------------------------------------------------------------------------
+# Stage 2: Minimal Runtime Environment
+# ------------------------------------------------------------------------------
+# FROM scratch
+# Deploys onto Docker's empty base image (0 bytes). Scratch provides no shell or OS packages,
+# resulting in an ultra-compact ~2.5MB binary container.
+FROM scratch
+
+# COPY --from=<stage> <src> <dest>
+# 1. /etc/passwd: Provides user account definitions so Docker can resolve 'USER appuser' to UID 10001.
+COPY --from=builder /etc/passwd /etc/passwd
+
+# 2. /etc/ssl/certs/ca-certificates.crt: Supplies trusted root certificates for outbound network requests.
+COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+
+# 3. /bin/generator: Copies the compiled static generator binary into the root directory.
+COPY --from=builder /bin/generator /generator
+
+# USER <user>
+# Switches runtime process ownership to non-root user 'appuser' (UID 10001).
+USER appuser
+
+# Note on EXPOSE:
+# The generator is purely an outbound TCP client connecting to INGESTION_GATEWAY_ADDR (0.0.0.0:8008).
+# Because it does not bind to any ingress ports, no EXPOSE instruction is declared.
+
+# ENTRYPOINT ["executable"]
+# JSON exec-form: executes the generator directly as PID 1 without an intermediate shell.
+ENTRYPOINT ["/generator"]

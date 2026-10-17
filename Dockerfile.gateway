@@ -1,0 +1,96 @@
+# ==============================================================================
+# Gobbler Ingestion Gateway Dockerfile
+#
+# Architecture: Multi-Stage Build (Alpine Builder -> Scratch Runtime)
+# Service Type: High-Throughput Network Listener & Event Stream Producer
+# Ports:        8008/TCP (Market Tick Ingestion), 6060/TCP (pprof Diagnostic Profiling)
+# Security:     Non-Root (UID 10001), 100% Static Linking, Zero Attack Surface
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# Stage 1: Build Environment
+# ------------------------------------------------------------------------------
+# FROM <image>[:<tag>] [AS <name>]
+# Initializes a new build stage named 'builder' using Go 1.25 on Alpine Linux.
+# Alpine is selected for its minimal footprint (~150MB toolchain) to compile static binaries.
+FROM golang:1.25-alpine AS builder
+
+# WORKDIR <path>
+# Sets the working directory inside the container for all subsequent RUN, COPY, and ADD commands.
+# If the directory does not exist, Docker creates it automatically.
+WORKDIR /build
+
+# RUN <command>
+# Executes a command in a new layer on top of the current image and commits the results.
+# Here, we create an unprivileged user named 'appuser' with:
+#   -D: Do not assign a password (disabled password).
+#   -u 10001: Explicitly allocate a non-system User ID (UID 10001).
+# We generate this in the builder so we can copy the resulting /etc/passwd into the final scratch image.
+RUN adduser -D -u 10001 appuser
+
+# COPY [--chown=<user>:<group>] <src>... <dest>
+# Copies files from the host build context into the container filesystem.
+# By copying ONLY the dependency definitions (go.mod, go.sum) first, we leverage Docker layer caching:
+# dependencies are cached unless go.mod or go.sum actually changes, avoiding redundant network downloads.
+COPY go.mod go.sum ./
+
+# RUN <command>
+# Downloads external Go modules into the local module cache ($GOPATH/pkg/mod).
+# Because this step precedes copying the source code, edits to main.go will not invalidate this cached layer.
+RUN go mod download
+
+# COPY <src>... <dest>
+# Copies the entire project context (excluding files matched in .dockerignore) into /build.
+COPY . .
+
+# RUN <command>
+# Compiles the standalone Go binary with environment variables and linker flags:
+#   CGO_ENABLED=0: Disables cgo (C bindings), producing a 100% statically linked ELF binary
+#                  with zero dependencies on external C libraries (libc/musl).
+#   GOOS=linux:    Enforces target operating system as Linux, ensuring cross-compilation consistency.
+#   -ldflags:      Passes flags to the underlying Go linker (go tool link):
+#     -s:          Strips symbol table (symbol names and addresses).
+#     -w:          Strips DWARF debugging information (shrinks binary size by ~30-40%).
+#   -o /bin/gateway: Designates the output executable destination.
+#   main.go:       Entrypoint source file containing the package main implementation.
+RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /bin/gateway main.go
+
+# ------------------------------------------------------------------------------
+# Stage 2: Minimal Runtime Environment
+# ------------------------------------------------------------------------------
+# FROM scratch
+# 'scratch' is Docker's special reserved empty image (0 bytes, 0 files).
+# It contains no shell (/bin/sh), no package manager, and no default utilities,
+# maximizing security and reducing the final image size to ~8MB.
+FROM scratch
+
+# COPY --from=<stage> <src> <dest>
+# Selectively copies artifacts from the 'builder' stage into the scratch runtime filesystem:
+# 1. /etc/passwd: Required by Docker and the Linux kernel to resolve the username 'appuser' to UID 10001.
+COPY --from=builder /etc/passwd /etc/passwd
+
+# 2. /etc/ssl/certs/ca-certificates.crt: Standard root CA trust store required for outbound TLS/HTTPS verification.
+COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+
+# 3. /bin/gateway: The self-contained static executable compiled in Stage 1.
+COPY --from=builder /bin/gateway /gateway
+
+# USER <user>[:<group>] or <UID>[:<GID>]
+# Drops root privileges and runs all subsequent processes as the unprivileged 'appuser' (UID 10001).
+# Enforces the Principle of Least Privilege in production container environments.
+USER appuser
+
+# EXPOSE <port>[/<protocol>] ...
+# Informs container runtimes that the container listens on these ports at runtime:
+#   8008: TCP port for high-speed financial market tick streaming.
+#   6060: HTTP port exposing net/http/pprof runtime metrics and memory/CPU profiles.
+# Note: EXPOSE serves as documentation; actual port publishing requires -p or Docker Compose/Kubernetes configs.
+EXPOSE 8008 6060
+
+# ENTRYPOINT ["executable", "param1", "param2"]
+# Configures the container to run as an executable.
+# Uses the preferred JSON exec-form syntax (square brackets) which:
+# 1. Bypasses the need for a shell interpreter (/bin/sh does not exist in scratch).
+# 2. Runs the process directly as PID 1, allowing OS signals (SIGTERM/SIGINT) to reach the Go binary
+#    instantly for coordinated 5-phase graceful shutdown.
+ENTRYPOINT ["/gateway"]

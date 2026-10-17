@@ -1,0 +1,98 @@
+# ==============================================================================
+# Gobbler ML Stream Inference & Anomaly Detection Worker Dockerfile
+#
+# Architecture: Multi-Stage Build (Python Slim Builder -> Python Slim Runtime)
+# Base Image:   python:3.12-slim (Debian GNU/Linux with glibc for pre-compiled wheels)
+# Service Type: Streaming Analytical Worker (Valkey Deduplication + ML Inference)
+# Ports:        None (Pure consumer from Kafka and Valkey cache)
+# Security:     Non-Root (UID 10001), Minimal Attack Surface (No build toolchains)
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# Stage 1: Build & Dependency Isolation Environment
+# ------------------------------------------------------------------------------
+# FROM <image>[:<tag>] [AS <name>]
+# Initializes the 'builder' stage using official Python 3.12 Debian slim.
+# Note on Base Image Selection:
+# We intentionally use Debian (slim) rather than Alpine because data science packages
+# (NumPy, SciPy, Scikit-learn, Confluent-Kafka) distribute pre-compiled binary wheels
+# for standard GNU glibc (manylinux). Alpine uses musl libc, which would force pip to
+# compile these heavy libraries from C/Fortran source code, multiplying build times.
+FROM python:3.12-slim AS builder
+
+# WORKDIR <path>
+# Establishes /build as the temporary workspace inside the builder container.
+WORKDIR /build
+
+# RUN <command>
+# Initializes a standalone Python virtual environment at /opt/venv.
+# Isolating dependencies into /opt/venv enables clean multi-stage copying:
+# we can copy the single /opt/venv directory into Stage 2 without carrying over
+# build caches, temporary wheels, or package manager state.
+RUN python -m venv /opt/venv
+
+# ENV <key>=<value> ...
+# Prepends the virtual environment's bin/ directory to PATH.
+# Ensures that subsequent 'pip' and 'python' commands target the virtual environment.
+ENV PATH="/opt/venv/bin:$PATH"
+
+# COPY [--chown=<user>:<group>] <src>... <dest>
+# Copies only the Python dependency manifest into /build.
+# Exploits Docker layer caching: dependencies are re-installed ONLY when requirements.txt changes.
+COPY consumer/requirements.txt ./
+
+# RUN <command>
+# Installs third-party dependencies into the virtual environment:
+#   --no-cache-dir: Disables pip's HTTP and wheel cache directory (~/.cache/pip),
+#                   preventing unnecessary disk usage in this layer.
+RUN pip install --no-cache-dir -r requirements.txt
+
+# ------------------------------------------------------------------------------
+# Stage 2: Minimal Runtime Environment
+# ------------------------------------------------------------------------------
+# FROM python:3.12-slim
+# Starts a fresh, clean Python 3.12 Debian slim image containing zero build utilities,
+# compilers, or pip cache artifacts from Stage 1.
+FROM python:3.12-slim
+
+# ENV <key>=<value> ...
+# Defines environment variables for the runtime container:
+#   PYTHONUNBUFFERED=1: Forces standard output and standard error streams to be unbuffered.
+#                       By default, Python block-buffers stdout when not connected to a TTY,
+#                       which delays log output in Docker/Kubernetes. Setting this to 1 ensures
+#                       real-time log streaming to 'docker logs'.
+#   PATH:               Prepends /opt/venv/bin to PATH so 'python' automatically runs from the virtualenv.
+ENV PYTHONUNBUFFERED=1 \
+    PATH="/opt/venv/bin:$PATH"
+
+# COPY --from=<stage> <src> <dest>
+# Copies the entire pre-compiled virtual environment (wheels, libraries, site-packages) from builder.
+COPY --from=builder /opt/venv /opt/venv
+
+# RUN <command>
+# Creates an unprivileged system user 'appuser' on Debian:
+#   -u 10001: Explicitly assigns non-root UID 10001 (consistent across all Gobbler microservices).
+#   -m:       Creates a home directory (/home/appuser) required by some Python libraries for local caching.
+RUN useradd -u 10001 -m appuser
+
+# WORKDIR <path>
+# Designates /app as the runtime working directory for the application.
+WORKDIR /app
+
+# COPY <src>... <dest>
+# Copies all consumer source files (consumer.py, detector.py) directly from the host into /app.
+COPY consumer/ ./
+
+# USER <user>
+# Drops root privileges and switches runtime execution to 'appuser' (UID 10001).
+USER appuser
+
+# Note on EXPOSE:
+# The ML consumer is an event-driven worker that polls Kafka and queries Valkey.
+# Because it does not expose any incoming network socket listeners, no EXPOSE is declared.
+
+# ENTRYPOINT ["executable", "param1", ...]
+# JSON exec-form syntax: executes the Python worker process directly as PID 1.
+# This ensures that OS interrupt signals (SIGINT / SIGTERM) are received immediately by consumer.py's
+# custom signal_handler, triggering graceful partition LeaveGroup requests and producer flushing.
+ENTRYPOINT ["python", "consumer.py"]
