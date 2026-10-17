@@ -43,7 +43,7 @@ Before computing feature engineering or anomaly inference on any tick, the Pytho
 
 ## 3. Docker Compose Service Definition
 
-In [`docker-compose.yml`](file:///home/pedrotorreao/Documents/Projects/gobbler/docker-compose.yml):
+In [`docker-compose.yml`](../docker-compose.yml):
 
 ```yaml
   valkey:

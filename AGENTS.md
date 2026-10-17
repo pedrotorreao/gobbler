@@ -15,3 +15,5 @@
   before ending a session. Never leave daemons running unattended.
 - When architectural changes are made, update the relevant `docs/` file(s) to
   reflect the new decision. Code and documentation should always agree.
+- Keep all documents always updated as changes are made. If you don't know
+  what to update, ask me.

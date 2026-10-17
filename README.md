@@ -38,7 +38,7 @@ Gobbler is a high-throughput, distributed market surveillance and streaming anal
 * **Failure Resilience & Backpressure**: Self-healing exponential backoff (`dispatchMsg`) that blocks worker routines on broker outages, safely propagating backpressure upstream to the TCP socket without dropping ticks or exceeding memory bounds.
 * **Chaos Engineering Verified**: 192,754 / 192,754 ticks delivered during live mid-stream broker freeze tests with 100.000% data integrity.
 
-### Phase 3: Stream Inference, Anomaly Detection & Distributed Caching (🚀 In Progress)
+### Phase 3: Stream Inference, Anomaly Detection & Distributed Caching (✅ Completed)
 * **Distributed Idempotency**: Valkey (Redis-compatible) cache on port `6379`. Each tick is deduplicated via an atomic `SET tick:<ticker>:<timestamp_ns> seen EX 60 NX` before reaching the inference layer, providing effectively-once processing across horizontally scaled consumer pods.
 * **Consumer Group Parallelism**: Python worker (`consumer/consumer.py`) subscribes via `confluent-kafka` with `enable.auto.commit=False`, committing offsets explicitly only after deduplication and inference. Graceful `LeaveGroup` on `SIGINT`/`SIGTERM` triggers immediate partition rebalancing.
 * **Two-Tier Anomaly Detector** (`consumer/detector.py`):
@@ -46,12 +46,22 @@ Gobbler is a high-throughput, distributed market surveillance and streaming anal
   * **Tier 2 — ML (sub-2ms)**: `IsolationForest(n_estimators=50)` fitted on normalized `[z_price, z_volume]` features from the rolling window, re-fitted every 100 ticks. Uses `score_samples` threshold (`< -0.65`) to avoid the Contamination Trap. Catches multivariate co-movement anomalies (e.g., volume-only spikes with no price shock).
   * **Detection Logic**: `is_anomaly = tier1_anomaly or (ml_score < -0.65)` — independent OR, either tier can fire without the other.
 
+### Phase 4: Time-Series Persistence & Infrastructure-as-Code (🚀 In Progress)
+* **High-Throughput Time-Series Database**: QuestDB integrated via Docker Compose (`docker-compose.yml`) exposing ILP (`:9000` HTTP, `:9009` TCP) and PGWire (`:8812`) with daily partitioned columnar storage for `market_ticks` and `market_anomalies`.
+* **Decoupled Go Persister Service**: Streaming persistence worker (`persister/persister.go`) consuming ticks and anomaly alerts with dual-trigger batching (5,000 rows or 500ms) and post-flush consumer offset commits.
+* **Production Containerization**: Multi-stage Dockerfiles for all microservices (`Dockerfile.gateway`, `Dockerfile.generator`, `Dockerfile.persister`, `Dockerfile.consumer`). Pure Go services compile to 100% static binaries on `scratch` (~2.5MB–8MB) and Python ML worker on `python:3.12-slim` (~413MB), all running as unprivileged user `appuser` (UID 10001).
+
 ---
 
 ## Repository Structure
 
 ```text
 ├── AGENTS.md                    # Agent persona rules (Socratic coding tutor)
+├── .dockerignore                # Build context filtering (excludes venv, pycache, git, logs)
+├── Dockerfile.consumer          # Python ML worker: multi-stage python:3.12-slim (/opt/venv -> non-root)
+├── Dockerfile.gateway           # TCP Gateway: multi-stage golang:1.25-alpine -> scratch (8.09MB)
+├── Dockerfile.generator         # Mock Generator: multi-stage golang:1.25-alpine -> scratch (2.57MB)
+├── Dockerfile.persister         # ILP Persister: multi-stage golang:1.25-alpine -> scratch (7.73MB)
 ├── consumer/
 │   ├── .venv/                   # Isolated Python virtual environment (uv-managed, git-ignored)
 │   ├── consumer.py              # Kafka consumer worker: dedup, inference loop, manual commits

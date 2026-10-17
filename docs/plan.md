@@ -94,8 +94,8 @@ Infrastructure-as-Code.
 *Automate environment setup and configure high-throughput analytical storage.*
 
 - [x] **Step 1:** Deploy QuestDB using Docker (`docker-compose.yml`) exposing InfluxDB Line Protocol (HTTP `:9000` & TCP `:9009`), PostgreSQL wire (`:8812`), and Web Console (`:9000`). Verified DDL table creation (`market_ticks`, `market_anomalies`), ILP HTTP ingestion (`204 OK`), and ASOF JOIN queries.
-- [x] **Step 2:** Write a dedicated Go persistence service ([`persister/persister.go`](file:///home/pedrotorreao/Documents/Projects/gobbler/persister/persister.go)) to ingest raw tick data (`market-ticks`) and anomaly alerts (`market-anomalies`) from Kafka into dedicated partitioned QuestDB tables (`market_ticks` and `market_anomalies`) via InfluxDB Line Protocol (ILP) with a dual-trigger batching strategy (5,000 rows or 500ms).
-- [ ] **Step 3:** Package every custom microservice (Ingest Gateway, Mock Generator, ML Worker, Persistence Worker) using multi-stage, minimal-footprint Dockerfiles.
+- [x] **Step 2:** Write a dedicated Go persistence service ([`persister/persister.go`](../persister/persister.go)) to ingest raw tick data (`market-ticks`) and anomaly alerts (`market-anomalies`) from Kafka into dedicated partitioned QuestDB tables (`market_ticks` and `market_anomalies`) via InfluxDB Line Protocol (ILP) with a dual-trigger batching strategy (5,000 rows or 500ms).
+- [x] **Step 3:** Package every custom microservice (Ingest Gateway, Mock Generator, ML Worker, Persistence Worker) using multi-stage, minimal-footprint Dockerfiles (`Dockerfile.gateway`, `Dockerfile.generator`, `Dockerfile.persister`, `Dockerfile.consumer`). All Go binaries compiled to static binaries on `scratch` (~2.5MB–8MB) and Python worker in `python:3.12-slim` (~413MB) running as unprivileged user `appuser` (UID 10001).
 - [ ] **Step 4:** Write OpenTofu scripts to declaratively provision local containers, storage volumes, and network bridges.
 - [ ] **Step 5:** Create local Kubernetes (Kind) manifests declaring Deployments, Services, ConfigMaps, and Horizontal Pod Autoscalers (HPA) for the Python consumer tier.
 
@@ -147,4 +147,6 @@ Infrastructure-as-Code.
 | Spin up local QuestDB container (Docker Compose) | Week 10 | [x] Completed |
 | Build Go ILP persistence worker (`persister/`) with dual-trigger batching | Week 10-11 | [x] Completed |
 | End-to-end verification of Phase 4 pipeline (Kafka -> Persister -> QuestDB) | Week 11 | [x] Completed |
+| Package microservices using multi-stage Dockerfiles (`gateway`, `generator`, `persister`, `consumer`) | Week 11-12 | [x] Completed |
+| Declarative container & volume orchestration via OpenTofu (IaC) | Week 12 | [ ] In Progress |
 

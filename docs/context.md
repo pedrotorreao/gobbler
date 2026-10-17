@@ -9,10 +9,10 @@
 Gobbler is a distributed real-time financial market surveillance and anomaly detection platform simulating high-throughput exchange data (~50,000 msgs/sec), ingesting it through a low-latency network gateway, streaming it via an event broker, detecting price anomalies with Python ML workers, and persisting records in a time-series database.
 
 * **Tech Stack**: Go 1.22+, Docker & Docker Compose, Redpanda (Kafka API), Python (NumPy/Scikit-learn - Phase 3), Valkey (Phase 3), QuestDB (Phase 4), Kind/OpenTofu (Phase 4).
-* **Roadmap Reference**: [`plan.md`](file:///home/pedrotorreao/Documents/Projects/gobbler/docs/plan.md)
-* **Redpanda Deep Dive**: [`redpanda.md`](file:///home/pedrotorreao/Documents/Projects/gobbler/docs/redpanda.md)
-* **Valkey Deep Dive**: [`valkey.md`](file:///home/pedrotorreao/Documents/Projects/gobbler/docs/valkey.md)
-* **QuestDB Deep Dive**: [`questdb.md`](file:///home/pedrotorreao/Documents/Projects/gobbler/docs/questdb.md)
+* **Roadmap Reference**: [`plan.md`](plan.md)
+* **Redpanda Deep Dive**: [`redpanda.md`](redpanda.md)
+* **Valkey Deep Dive**: [`valkey.md`](valkey.md)
+* **QuestDB Deep Dive**: [`questdb.md`](questdb.md)
 
 ---
 
@@ -30,28 +30,28 @@ Gobbler is a distributed real-time financial market surveillance and anomaly det
    * Phase E: Wait for workers to drain remaining jobs (`workerWg.Wait()`, `[4/5]`).
    * Phase F: Flush and close Kafka writer (`[5/5]`).
 5. **Observability**: Background throughput reporter (`reportThroughput`) and embedded `net/http/pprof` server on `127.0.0.1:6060`.
-6. **Synthetic Generator**: Standalone executable in [`generator/generator.go`](file:///home/pedrotorreao/Documents/Projects/gobbler/generator/generator.go) simulating random-walk order flows (`PETR4`, `VALE3`, `ITUB4`, `BBDC4`) with 0.1% probability anomaly spikes.
+6. **Synthetic Generator**: Standalone executable in [`generator/generator.go`](../generator/generator.go) simulating random-walk order flows (`PETR4`, `VALE3`, `ITUB4`, `BBDC4`) with 0.1% probability anomaly spikes.
 
 ### Phase 2: Event Streaming & Decoupled Architecture (✅ COMPLETED)
-1. **Redpanda in Docker**: Single-node broker deployed via [`docker-compose.yml`](file:///home/pedrotorreao/Documents/Projects/gobbler/docker-compose.yml) exposing port `9092` (Kafka API) and `9644` (Admin API). Runs in `--mode dev-container`.
-2. **Kafka Producer**: Integrated `segmentio/kafka-go` into [`main.go`](file:///home/pedrotorreao/Documents/Projects/gobbler/main.go) sharing a single thread-safe `*kafka.Writer`.
+1. **Redpanda in Docker**: Single-node broker deployed via [`docker-compose.yml`](../docker-compose.yml) exposing port `9092` (Kafka API) and `9644` (Admin API). Runs in `--mode dev-container`.
+2. **Kafka Producer**: Integrated `segmentio/kafka-go` into [`main.go`](../main.go) sharing a single thread-safe `*kafka.Writer`.
 3. **Partitioning Strategy**: Unified topic `market-ticks` with **4 partitions**. Configured `Balancer: &kafka.Hash{}` with `Key: []byte(tick.Ticker)` guaranteeing strict per-asset FIFO ordering.
 4. **Producer Resilience & Backpressure**: Implemented `dispatchMsg` with exponential backoff (`50ms` up to `1s` ceiling). Drains safely on writer closure via `io.ErrClosedPipe`.
 5. **Chaos Verification**: Live mid-stream broker pause (`docker pause redpanda`) proved zero data loss: **192,754 / 192,754 ticks delivered (100.000%)** with automatic backpressure halting the generator and self-healing upon unpause.
 
-### Phase 3: Stream Inference, Anomaly Detection & Distributed Caching (🚀 IN PROGRESS)
-1. **Valkey Service (Step 1 - Complete)**: Added `valkey/valkey:latest` to [`docker-compose.yml`](file:///home/pedrotorreao/Documents/Projects/gobbler/docker-compose.yml) on port `6379:6379` with `command: ["valkey-server", "--save", ""]` for ephemeral, ultra-fast in-memory execution without background snapshot disk I/O.
+### Phase 3: Stream Inference, Anomaly Detection & Distributed Caching (✅ COMPLETED)
+1. **Valkey Service (Step 1 - Complete)**: Added `valkey/valkey:latest` to [`docker-compose.yml`](../docker-compose.yml) on port `6379:6379` with `command: ["valkey-server", "--save", ""]` for ephemeral, ultra-fast in-memory execution without background snapshot disk I/O.
 2. **Stateless Python Consumer (Step 2 - Complete & Verified)**:
-   * Built isolated analytical worker environment inside [`consumer/`](file:///home/pedrotorreao/Documents/Projects/gobbler/consumer) managed with `uv`.
+   * Built isolated analytical worker environment inside [`consumer/`](../consumer/) managed with `uv`.
    * Integrated `confluent-kafka` client with manual offset commits (`enable.auto.commit = False`) to guarantee at-least-once delivery.
    * Graceful signal handling (`SIGINT`/`SIGTERM`) triggering explicit `consumer.close()` (`LeaveGroup` protocol request) for instantaneous partition rebalance.
    * End-to-end verification passed: **121,416 / 121,416 messages** ingested by Go gateway, published to Redpanda, consumed by Python worker, and committed with **0 total lag**.
 3. **Distributed Idempotent Consumer (Step 3 - Complete)**:
-   * Fixed `TimestampNs` from `int16` to `int64` across [`main.go`](file:///home/pedrotorreao/Documents/Projects/gobbler/main.go) and [`generator/generator.go`](file:///home/pedrotorreao/Documents/Projects/gobbler/generator/generator.go), eliminating wrap-around collisions and enabling zero-allocation nanosecond trade tracking.
+   * Fixed `TimestampNs` from `int16` to `int64` across [`main.go`](../main.go) and [`generator/generator.go`](../generator/generator.go), eliminating wrap-around collisions and enabling zero-allocation nanosecond trade tracking.
    * Expanded ticker seeds from 4 to 10 assets (`PETR4`, `VALE3`, `BBDC4`, `JBSS3`, `ITUB4`, `ABEV3`, `BBAS3`, `WEGE3`, `MGLU3`, `RENT3`) to uniformly saturate all 4 Kafka partitions under FNV-1a hashing.
-   * Integrated atomic check-and-set deduplication in [`consumer/consumer.py`](file:///home/pedrotorreao/Documents/Projects/gobbler/consumer/consumer.py) using `valkey_client.set(f"tick:{ticker}:{timestamp}", "seen", ex=60, nx=True)`. Duplicates are acknowledged to Kafka and dropped before reaching the ML inference layer.
+   * Integrated atomic check-and-set deduplication in [`consumer/consumer.py`](../consumer/consumer.py) using `valkey_client.set(f"tick:{ticker}:{timestamp}", "seen", ex=60, nx=True)`. Duplicates are acknowledged to Kafka and dropped before reaching the ML inference layer.
 4. **Stream Inference & Anomaly Detection (Step 4 - Complete)**:
-   * Built [`consumer/detector.py`](file:///home/pedrotorreao/Documents/Projects/gobbler/consumer/detector.py): `RollingZScoreDetector` maintaining a 2D circular buffer `deque[tuple[float, int]]` storing `(price, volume)` per ticker.
+   * Built [`consumer/detector.py`](../consumer/detector.py): `RollingZScoreDetector` maintaining a 2D circular buffer `deque[tuple[float, int]]` storing `(price, volume)` per ticker.
    * **Tier 1 (Statistical)**: Dual-Condition Guard — `|z_price| > 3.0` AND `pct_change >= 2.0%` — guards against the micro-volatility trap (zero-std false positives).
    * **Tier 2 (ML)**: `sklearn.ensemble.IsolationForest(n_estimators=50, contamination=0.02, random_state=42)`, fitted on normalized features `[z_price, z_volume]` and re-fitted every `refit_interval=100` ticks.
    * **ML Score Delay**: Both fitting and scoring deferred until `tick_counters[ticker] >= ml_score_delay` (default 500). IsolationForest is stateless — each `.fit()` discards the previous model. Early fits on the narrow cold-start window produce poorly-calibrated boundaries. Delaying both fit and score to tick 500 ensures the first trusted model is trained on a regime-stable distribution. During delay: `ml_score = 0.0`, Tier 1 only.
@@ -67,15 +67,27 @@ Gobbler is a distributed real-time financial market surveillance and anomaly det
    * End-to-end verified live: `market-anomalies` topic consumed, confirming correct JSON schema, partition routing by ticker key, and FIFO ordering.
 
 ### Phase 4: Time-Series Persistence & Infrastructure-as-Code (🚀 IN PROGRESS)
-1. **QuestDB Ingestion Infrastructure (Step 1 - Complete)**: Added `questdb/questdb:latest` to [`docker-compose.yml`](file:///home/pedrotorreao/Documents/Projects/gobbler/docker-compose.yml) exposing port `9000` (Web Console, REST, HTTP ILP), `9009` (TCP ILP), and `8812` (PGWire). Pre-created partitioned tables `market_ticks` and `market_anomalies` (`PARTITION BY DAY`) with symbol caching (`CAPACITY 16 CACHE`), and verified ILP HTTP writes and `ASOF JOIN` queries.
+1. **QuestDB Ingestion Infrastructure (Step 1 - Complete)**: Added `questdb/questdb:latest` to [`docker-compose.yml`](../docker-compose.yml) exposing port `9000` (Web Console, REST, HTTP ILP), `9009` (TCP ILP), and `8812` (PGWire). Pre-created partitioned tables `market_ticks` and `market_anomalies` (`PARTITION BY DAY`) with symbol caching (`CAPACITY 16 CACHE`), and verified ILP HTTP writes and `ASOF JOIN` queries.
 2. **Go Persistence Worker (Step 2 - Built & Documented)**:
-   * Built dedicated streaming worker in [`persister/persister.go`](file:///home/pedrotorreao/Documents/Projects/gobbler/persister/persister.go).
+   * Built dedicated streaming worker in [`persister/persister.go`](../persister/persister.go).
    * Separate consumer groups: `gobbler-ticks-persister-group` and `gobbler-anomalies-persister-group` with `StartOffset: kafka.FirstOffset`.
    * High-performance ILP formatting via `strconv.Append*` and slice buffer reuse.
    * Dual-trigger batching engine (`batchSize=5000` or `flushInterval=500ms`).
    * HTTP POST flushes to QuestDB `/write` endpoint with Keep-Alive connection pooling.
-   * Multi-partition offset commits (`reader.CommitMessages(ctx, batchKafkaMessages...)`) executed only post-flush acknowledgment (HTTP 204/200).
+7. Multi-partition offset commits (`reader.CommitMessages(ctx, batchKafkaMessages...)`) executed only post-flush acknowledgment (HTTP 204/200).
    * Clean shutdown lifecycle handling draining in-flight buffers under a 3-second bounded context timeout.
+3. **Microservices Containerization (Step 3 - Complete & Documented)**:
+   * **12-Factor Configuration**: Integrated dynamic environment variable overrides (`KAFKA_BROKER`, `INGESTION_GATEWAY_ADDR`, `INGESTION_GATEWAY_PORT`, `PPROF_ADDR`, `QUESTDB_URL`, `VALKEY_HOST`, `VALKEY_PORT`) across Go and Python codebases.
+   * **Go Services ([`Dockerfile.gateway`](../Dockerfile.gateway), [`Dockerfile.generator`](../Dockerfile.generator), [`Dockerfile.persister`](../Dockerfile.persister))**:
+     - Multi-stage: `golang:1.25-alpine` builder -> `FROM scratch` runtime.
+     - Security: 100% static binaries (`CGO_ENABLED=0`, `-ldflags="-s -w"`), running as unprivileged `appuser` (UID 10001).
+     - Minimal footprints: Gateway (~8.09 MB), Generator (~2.57 MB), Persister (~7.73 MB).
+   * **Python ML Worker ([`Dockerfile.consumer`](../Dockerfile.consumer))**:
+     - Multi-stage: `python:3.12-slim` builder (isolated virtualenv `/opt/venv`) -> `python:3.12-slim` runtime.
+     - Debian glibc chosen over Alpine to utilize pre-compiled wheels for NumPy, SciPy, Scikit-learn, and Confluent-Kafka without compiling from source.
+     - Real-time logging configured via `ENV PYTHONUNBUFFERED=1` and unprivileged execution (`UID 10001`).
+   * **Build Context Optimization ([`.dockerignore`](../.dockerignore))**: Excluded virtualenvs, Python caches, git objects, and logs, shrinking context from 242MB to <50KB.
+   * **Documentation**: Full line-by-line comments added across all Dockerfiles detailing Docker syntax, layer caching, and security rationale.
 
 ---
 
@@ -144,6 +156,11 @@ Gobbler is a distributed real-time financial market surveillance and anomaly det
 
 ```text
 ├── AGENTS.md                    # Agent persona rules (Socratic coding tutor)
+├── .dockerignore                # Build context filtering (excludes venv, pycache, git, logs)
+├── Dockerfile.consumer          # Python ML worker: multi-stage python:3.12-slim (/opt/venv -> non-root)
+├── Dockerfile.gateway           # TCP Gateway: multi-stage golang:1.25-alpine -> scratch (8.09MB)
+├── Dockerfile.generator         # Mock Generator: multi-stage golang:1.25-alpine -> scratch (2.57MB)
+├── Dockerfile.persister         # ILP Persister: multi-stage golang:1.25-alpine -> scratch (7.73MB)
 ├── consumer/
 │   ├── .venv/                   # Isolated virtual environment (git-ignored)
 │   ├── consumer.py              # Kafka consumer: dedup, inference loop, anomaly producer, manual commits
@@ -171,7 +188,7 @@ Gobbler is a distributed real-time financial market surveillance and anomaly det
 
 ## 6. Immediate Next Steps: Phase 4 (Time-Series Persistence & Infrastructure-as-Code)
 
-* [x] **Step 1**: Spin up **QuestDB** in [`docker-compose.yml`](file:///home/pedrotorreao/Documents/Projects/gobbler/docker-compose.yml) (Port `9000` Web/HTTP/ILP, Port `9009` TCP ILP, Port `8812` PGWire). Verified DDL table creation (`market_ticks`, `market_anomalies`), ILP HTTP ingestion (`204 OK`), and `ASOF JOIN` analytics.
-* [x] **Step 2**: Implement dedicated Go persistence service ([`persister/persister.go`](file:///home/pedrotorreao/Documents/Projects/gobbler/persister/persister.go)) subscribing to `market-ticks` and `market-anomalies`, formatting ILP batches (5,000 rows or 500ms), and streaming to QuestDB with post-flush offset commits.
-* [x] **Step 3**: Execute end-to-end live verification of full pipeline: Gateway -> Redpanda -> ML Worker (anomalies) -> Persister -> QuestDB tables. Verified: 69,966 ticks and 1,622 anomalies persisted across all 10 assets, with zero consumer group lag and verified ASOF JOIN analytics.
-* **Next Steps**: Step 3 (Multi-stage Dockerfiles for all microservices) and Step 4 (OpenTofu IaC).
+* [x] **Step 1**: Spin up **QuestDB** in [`docker-compose.yml`](../docker-compose.yml) (Port `9000` Web/HTTP/ILP, Port `9009` TCP ILP, Port `8812` PGWire). Verified DDL table creation (`market_ticks`, `market_anomalies`), ILP HTTP ingestion (`204 OK`), and `ASOF JOIN` analytics.
+* [x] **Step 2**: Implement dedicated Go persistence service ([`persister/persister.go`](../persister/persister.go)) subscribing to `market-ticks` and `market-anomalies`, formatting ILP batches (5,000 rows or 500ms), and streaming to QuestDB with post-flush offset commits.
+* [x] **Step 3**: Package every custom microservice using multi-stage, minimal-footprint Dockerfiles ([`Dockerfile.gateway`](../Dockerfile.gateway), [`Dockerfile.generator`](../Dockerfile.generator), [`Dockerfile.persister`](../Dockerfile.persister), [`Dockerfile.consumer`](../Dockerfile.consumer)). Verified all Go binaries on `scratch` (~2.5MB–8MB) and Python on `python:3.12-slim` (~413MB) running as unprivileged user `appuser` (UID 10001).
+* **Next Steps**: Step 4 (OpenTofu Infrastructure-as-Code) and Step 5 (Kind Kubernetes manifests).
