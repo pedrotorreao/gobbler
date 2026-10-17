@@ -66,13 +66,13 @@ func main() {
 	// Balancer: &kafka.Hash{} hashes the message key (asset ticker) to ensure
 	// strict per-asset FIFO ordering within dedicated topic partitions.
 	kafkaWriter := &kafka.Writer{
-		Addr:         kafka.TCP("localhost:9092"), // Redpanda/Kafka broker endpoint
-		Topic:        "market-ticks",              // Target event stream topic for financial trade ticks
-		Balancer:     &kafka.Hash{},               // Key hasher (fnv-1a) ensuring deterministic, strict per-ticker FIFO ordering
-		BatchSize:    100,                         // Maximum message count before triggering an immediate batch write
-		BatchTimeout: 5 * time.Millisecond,        // Flush interval threshold to minimize streaming latency during low volume
-		RequiredAcks: kafka.RequireOne,            // Await confirmation from the partition leader before considering write successful
-		WriteTimeout: 2 * time.Second,             // Fail-safe deadline to prevent worker goroutines from blocking on dead brokers
+		Addr:         kafka.TCP(getEnv("KAFKA_BROKER", "localhost:9092")), // Redpanda/Kafka broker endpoint
+		Topic:        "market-ticks",                                      // Target event stream topic for financial trade ticks
+		Balancer:     &kafka.Hash{},                                       // Key hasher (fnv-1a) ensuring deterministic, strict per-ticker FIFO ordering
+		BatchSize:    100,                                                 // Maximum message count before triggering an immediate batch write
+		BatchTimeout: 5 * time.Millisecond,                                // Flush interval threshold to minimize streaming latency during low volume
+		RequiredAcks: kafka.RequireOne,                                    // Await confirmation from the partition leader before considering write successful
+		WriteTimeout: 2 * time.Second,                                     // Fail-safe deadline to prevent worker goroutines from blocking on dead brokers
 	}
 
 	// Scale worker goroutines to match the available logical CPU cores for CPU-bound JSON parsing.
@@ -94,8 +94,8 @@ func main() {
 	// -------------------------------------------------------------------------
 	// Step 4: TCP Listener Setup
 	// -------------------------------------------------------------------------
-	serverIPAddr := "127.0.0.1"
-	serverPort := "8008"
+	serverIPAddr := getEnv("INGESTION_GATEWAY_ADDR", "0.0.0.0")
+	serverPort := getEnv("INGESTION_GATEWAY_PORT", "8008")
 
 	listener, err := net.Listen("tcp", fmt.Sprintf("%s:%s", serverIPAddr, serverPort))
 	if err != nil {
@@ -114,8 +114,9 @@ func main() {
 	// -------------------------------------------------------------------------
 	// Launch an embedded HTTP server on port 6060 to expose live pprof memory and CPU profiling data.
 	go func() {
-		log.Println("pprof server listening on http://127.0.0.1:6060/debug/pprof/")
-		if err := http.ListenAndServe("127.0.0.1:6060", nil); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		pprofAddr := getEnv("PPROF_ADDR", "0.0.0.0:6060")
+		log.Printf("pprof server listening on http://%s/debug/pprof/\n", pprofAddr)
+		if err := http.ListenAndServe(pprofAddr, nil); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Fatalf("pprof server error: %v", err)
 		}
 	}()
@@ -309,4 +310,11 @@ func reportThroughput(ctx context.Context) {
 			}
 		}
 	}
+}
+
+func getEnv(key, fallback string) string {
+	if value := os.Getenv(key); value != "" {
+		return value
+	}
+	return fallback
 }

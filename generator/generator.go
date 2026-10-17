@@ -14,6 +14,7 @@ import (
 	"log"
 	"math/rand"
 	"net"
+	"os"
 	"sync"
 	"time"
 )
@@ -39,7 +40,7 @@ func main() {
 	// -------------------------------------------------------------------------
 	// Step 1: Network Socket Dialing
 	// -------------------------------------------------------------------------
-	targetAddr := "127.0.0.1:8008"
+	targetAddr := getEnv("INGESTION_GATEWAY_ADDR", "127.0.0.1:8008")
 	conn, err := net.Dial("tcp", targetAddr)
 	if err != nil {
 		log.Fatalf("Failed to connect to gateway at %s: %v\n", targetAddr, err)
@@ -153,4 +154,11 @@ func simulateTicker(state TickerState, out chan<- MarketTick) {
 		// Throttle frequency: sleep 500 microseconds (~2,000 ticks/sec per ticker)
 		time.Sleep(500 * time.Microsecond)
 	}
+}
+
+func getEnv(key, fallback string) string {
+	if value := os.Getenv(key); value != "" {
+		return value
+	}
+	return fallback
 }

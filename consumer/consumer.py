@@ -35,6 +35,7 @@ import json
 import signal
 import sys
 import redis
+import os
 from confluent_kafka import Consumer, KafkaError, KafkaException, Producer
 try:
     from detector import RollingZScoreDetector
@@ -46,7 +47,7 @@ running = True
 
 # Initialize a thread-safe connection pool to the distributed Valkey cache.
 # decode_responses=True ensures string return values instead of raw byte strings.
-valkey_client = redis.Redis(host='localhost', port=6379, decode_responses=True)
+valkey_client = redis.Redis(host=os.environ.get("VALKEY_HOST", "localhost"), port=int(os.environ.get("VALKEY_PORT", 6379)), decode_responses=True)
 
 
 def signal_handler(sig, frame):
@@ -80,7 +81,7 @@ def run_consumer():
     """
     conf_consumer = {
         # Network address of the Redpanda broker
-        'bootstrap.servers': 'localhost:9092',
+        'bootstrap.servers': os.environ.get("KAFKA_BROKER", "localhost:9092"),
         # Shared consumer group ID enabling horizontal scaling across worker processes
         'group.id': 'gobbler-ml-consumers',
         # Read from earliest available offset if no previous committed offset exists
@@ -91,7 +92,7 @@ def run_consumer():
 
     conf_producer = {
         # Network address of the Redpanda broker
-        'bootstrap.servers': 'localhost:9092',
+        'bootstrap.servers': os.environ.get("KAFKA_BROKER", "localhost:9092"),
         # acks='1': Leader acknowledges the write before responding.
         # Balances durability (vs acks='0' fire-and-forget) with throughput
         # (vs acks='all' which waits for all ISR replicas to confirm).
