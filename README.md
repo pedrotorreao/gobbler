@@ -74,6 +74,7 @@ Gobbler is a high-throughput, distributed market surveillance and streaming anal
 │   ├── plan.md                  # Interactive project roadmap, milestones & definitions of done
 │   ├── questdb.md               # Deep-dive architecture reference, ILP guide & SQL reference for QuestDB
 │   ├── redpanda.md              # Deep-dive architecture reference & CLI guide for Redpanda
+│   ├── terraform.md             # Terraform & OpenTofu concepts, Docker provider & CLI guide
 │   └── valkey.md                # Valkey concepts, Idempotent Consumer pattern & CLI guide
 ├── generator/
 │   └── generator.go             # Standalone synthetic market load generator (10 B3 assets)

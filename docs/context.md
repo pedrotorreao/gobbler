@@ -13,6 +13,7 @@ Gobbler is a distributed real-time financial market surveillance and anomaly det
 * **Redpanda Deep Dive**: [`redpanda.md`](redpanda.md)
 * **Valkey Deep Dive**: [`valkey.md`](valkey.md)
 * **QuestDB Deep Dive**: [`questdb.md`](questdb.md)
+* **Terraform / IaC Deep Dive**: [`terraform.md`](terraform.md)
 
 ---
 
@@ -173,6 +174,7 @@ Gobbler is a distributed real-time financial market surveillance and anomaly det
 │   ├── plan.md                  # Project roadmap & progress tracker
 │   ├── questdb.md               # QuestDB concepts, ILP format, table partitioning & SQL reference
 │   ├── redpanda.md              # Redpanda concepts, CLI guide & architecture reference
+│   ├── terraform.md             # Terraform & OpenTofu concepts, Docker provider & CLI guide
 │   └── valkey.md                # Valkey concepts, Idempotent Consumer & CLI guide
 ├── generator/
 │   └── generator.go             # Package main - standalone exchange simulator (10 B3 assets)
