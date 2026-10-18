@@ -40,8 +40,21 @@ Thumbs.db
 .env.*
 !.env.example
 
-# Others
-.markdownlint.json
-
+# Python virtual environment & cache
 consumer/.venv/
-__pycache__/
+**/__pycache__/
+*.py[cod]
+*$py.class
+
+# Logs
+*.log
+
+# Terraform & OpenTofu files
+**/.terraform/
+*.tfstate
+*.tfstate.*
+crash.log
+crash.*.log
+*.tfplan
+*tfplan*
+# Note: .terraform.lock.hcl is intentionally NOT ignored (HashiCorp recommends committing it)
