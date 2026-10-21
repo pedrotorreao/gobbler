@@ -89,6 +89,19 @@ Gobbler is a distributed real-time financial market surveillance and anomaly det
      - Real-time logging configured via `ENV PYTHONUNBUFFERED=1` and unprivileged execution (`UID 10001`).
    * **Build Context Optimization ([`.dockerignore`](../.dockerignore))**: Excluded virtualenvs, Python caches, git objects, and logs, shrinking context from 242MB to <50KB.
    * **Documentation**: Full line-by-line comments added across all Dockerfiles detailing Docker syntax, layer caching, and security rationale.
+4. **Infrastructure-as-Code with Terraform / OpenTofu (Step 4 - Complete & Verified)**:
+   * Codified entire local data plane and microservice stack under [`infra/`](../infra/) using `kreuzwerker/docker >= 3.0.2`.
+   * **Foundational Layer ([`infra/main.tf`](../infra/main.tf), [`infra/versions.tf`](../infra/versions.tf))**: Provisions dedicated bridge network `gobbler-network` with automatic container DNS, and named volume `questdb_data` mounted to `/var/lib/questdb`.
+   * **Auxiliary Data Plane ([`infra/auxiliary.tf`](../infra/auxiliary.tf))**:
+     - `valkey`: Configured with `--save "\"\""` to disable RDB snapshots for sub-millisecond in-memory cache operations, satisfying provider validation.
+     - `redpanda`: Configured with `--smp 1`, `--memory 1G`, and **Dual Named Listeners** (`internal://0.0.0.0:29092` advertised as `internal://redpanda:29092` for container-to-container traffic, and `external://0.0.0.0:9092` advertised as `external://localhost:9092` for host development and `rpk` CLI).
+     - `questdb`: Configured with ports `9000` (Web/REST/ILP), `9009` (TCP ILP), `8812` (PGWire), and persistent volume mount.
+   * **Option C Modular Architecture ([`infra/workloads.tf`](../infra/workloads.tf))**:
+     - Feature toggle via `count = var.enable_microservices ? 1 : 0`.
+     - Default (`false`): Provisions auxiliary data plane only, enabling rapid host-based development loops.
+     - Full-Stack (`true`): Provisions `gobbler-gateway`, `gobbler-persister`, and `gobbler-consumer` containers with 12-factor environment variables and DAG dependencies (`depends_on`).
+   * **Output Contracts ([`infra/outputs.tf`](../infra/outputs.tf))**: Exports connection endpoints and dynamic gateway status (`localhost:8008` vs disabled).
+   * **Live Verification**: `terraform apply` successfully provisioned all resources; verified container health, Redpanda `rpk cluster info`, Valkey `PONG`, and QuestDB SQL REST API (`/exec?query=show+tables`).
 
 ---
 
@@ -193,4 +206,5 @@ Gobbler is a distributed real-time financial market surveillance and anomaly det
 * [x] **Step 1**: Spin up **QuestDB** in [`docker-compose.yml`](../docker-compose.yml) (Port `9000` Web/HTTP/ILP, Port `9009` TCP ILP, Port `8812` PGWire). Verified DDL table creation (`market_ticks`, `market_anomalies`), ILP HTTP ingestion (`204 OK`), and `ASOF JOIN` analytics.
 * [x] **Step 2**: Implement dedicated Go persistence service ([`persister/persister.go`](../persister/persister.go)) subscribing to `market-ticks` and `market-anomalies`, formatting ILP batches (5,000 rows or 500ms), and streaming to QuestDB with post-flush offset commits.
 * [x] **Step 3**: Package every custom microservice using multi-stage, minimal-footprint Dockerfiles ([`Dockerfile.gateway`](../Dockerfile.gateway), [`Dockerfile.generator`](../Dockerfile.generator), [`Dockerfile.persister`](../Dockerfile.persister), [`Dockerfile.consumer`](../Dockerfile.consumer)). Verified all Go binaries on `scratch` (~2.5MB–8MB) and Python on `python:3.12-slim` (~413MB) running as unprivileged user `appuser` (UID 10001).
-* **Next Steps**: Step 4 (OpenTofu Infrastructure-as-Code) and Step 5 (Kind Kubernetes manifests).
+* [x] **Step 4**: Declarative container, network, and volume orchestration via **Terraform / OpenTofu** in [`infra/`](../infra/). Verified auxiliary data plane live apply, dual-listener Kafka architecture, and Option C microservice toggle.
+* **Next Steps**: Step 5 (Kind Kubernetes cluster manifests, Helm/Kustomize, and HPA).

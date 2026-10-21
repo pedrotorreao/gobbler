@@ -148,5 +148,5 @@ Infrastructure-as-Code.
 | Build Go ILP persistence worker (`persister/`) with dual-trigger batching | Week 10-11 | [x] Completed |
 | End-to-end verification of Phase 4 pipeline (Kafka -> Persister -> QuestDB) | Week 11 | [x] Completed |
 | Package microservices using multi-stage Dockerfiles (`gateway`, `generator`, `persister`, `consumer`) | Week 11-12 | [x] Completed |
-| Declarative container & volume orchestration via OpenTofu (IaC) | Week 12 | [ ] In Progress |
+| Declarative container & volume orchestration via OpenTofu (IaC) | Week 12 | [x] Completed |
 

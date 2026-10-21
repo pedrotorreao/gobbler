@@ -59,9 +59,9 @@ The `kreuzwerker/docker` provider communicates directly with the local Docker da
 ### Key Resource Types
 | Resource | Purpose | Gobbler Implementation |
 | :--- | :--- | :--- |
-| **`docker_network`** | Creates user-defined bridge networks. | Provisions `gobbler_net` with automatic container-to-container DNS resolution (`redpanda`, `questdb`, `valkey`). |
+| **`docker_network`** | Creates user-defined bridge networks. | Provisions `gobbler-network` with automatic container-to-container DNS resolution (`redpanda`, `questdb`, `valkey`). |
 | **`docker_volume`** | Provisions persistent named storage volumes. | Backs QuestDB root data (`questdb_data`) so table partitions survive container recreation. |
-| **`docker_image`** | Manages container image pulls and cache integrity. | Pulls official images (`redpandadata/redpanda`, `valkey/valkey`, `questdb/questdb`). |
+| **`docker_image`** | Manages container image pulls and cache integrity. | Pulls official images (`redpandadata/redpanda`, `valkey/valkey`, `questdb/questdb`) with `keep_locally = true`. |
 | **`docker_container`** | Lifecycle management of running containers. | Declares ports, environment variables, mounts, health checks, and entrypoints. |
 
 ---
@@ -72,9 +72,9 @@ In `infra/`, we separate foundational **data plane backbones** from transient **
 
 ```text
 infra/
-├── versions.tf        # Provider requirements & engine constraints
+├── versions.tf        # Provider requirements & engine constraints (kreuzwerker/docker >= 3.0.2)
 ├── variables.tf       # Configurable inputs (ports, image tags, feature toggles)
-├── main.tf            # Core network (gobbler_net) and storage volumes
+├── main.tf            # Core network (gobbler-network) and storage volume (questdb_data)
 ├── auxiliary.tf       # Stateful engines: Redpanda, Valkey, and QuestDB
 ├── workloads.tf       # Microservices: Gateway, Persister, and Consumer
 └── outputs.tf         # Exported connection URLs and host:port endpoints
@@ -84,7 +84,7 @@ infra/
 In `infra/variables.tf`:
 ```hcl
 variable "enable_microservices" {
-  description = "Toggle provisioning of Gobbler application microservices"
+  description = "Option C toggle: when false (default), provisions only the auxiliary data plane; when true, deploys custom Go/Python microservices in Docker"
   type        = bool
   default     = false
 }
@@ -95,12 +95,42 @@ In `infra/workloads.tf`:
 resource "docker_container" "gateway" {
   count = var.enable_microservices ? 1 : 0
   name  = "gobbler-gateway"
-  image = docker_image.gateway[0].image_id
+  image = "gobbler-gateway:latest"
   # ...
 }
 ```
 * **Default Mode (`false`)**: Spins up Redpanda, Valkey, and QuestDB. Developers can edit Go/Python code locally and run against the live data plane.
-* **Full-Stack Demo Mode (`true`)**: Spins up the entire 7-container surveillance platform with a single flag (`terraform apply -var="enable_microservices=true"`).
+* **Full-Stack Demo Mode (`true`)**: Spins up the entire distributed surveillance platform with a single flag (`terraform apply -var="enable_microservices=true"`).
+
+### Kafka Networking & The Dual-Listener Strategy
+
+Kafka and Redpanda clients connect in two steps:
+1. **Bootstrap Phase**: The client connects to the initial broker address (e.g. `redpanda:29092` or `localhost:9092`) and requests cluster metadata.
+2. **Metadata Reconnection**: The broker responds with the **Advertised Address** for partition leaders. The client then disconnects from the bootstrap socket and initiates all data production/consumption to that advertised address.
+
+```mermaid
+graph LR
+    subgraph Host["Host Machine"]
+        HostApps["go run main.go / rpk CLI"]
+    end
+
+    subgraph DockerNet["Docker Bridge: gobbler-network"]
+        Containers["gobbler-consumer / persister"]
+        subgraph Redpanda["Redpanda Container"]
+            Ext["external: 0.0.0.0:9092<br/>(Advertised: localhost:9092)"]
+            Int["internal: 0.0.0.0:29092<br/>(Advertised: redpanda:29092)"]
+        end
+    end
+
+    HostApps -->|Port 9092| Ext
+    Containers -->|Port 29092| Int
+```
+
+If Redpanda only advertised `localhost:9092`, containerized workloads on `gobbler-network` would attempt to reconnect to `localhost` inside their own network namespaces and fail with `Connection refused`.
+
+To solve this, Redpanda is configured with **dual named listeners**:
+* **Internal Listener (`internal://0.0.0.0:29092`)**: Advertised as `internal://redpanda:29092` for microservices within the Docker network.
+* **External Listener (`external://0.0.0.0:9092`)**: Advertised as `external://localhost:9092` and published to the host for local development, tests, and the `rpk` CLI.
 
 ---
 
