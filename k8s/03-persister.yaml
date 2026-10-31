@@ -1,0 +1,66 @@
+# ==============================================================================
+# Gobbler Time-Series Persister: Deployment Manifest
+# ==============================================================================
+# This manifest defines the lifecycle, replicas, and container specification
+# for Gobbler's high-performance Go ILP streaming persistence worker.
+#
+# Architectural Characteristics:
+#   1. Pure Consumer / Worker Pattern:
+#      - Consumes 'market-ticks' and 'market-anomalies' streams from Redpanda.
+#      - Buffers rows into batch slices (5,000 rows or 500ms trigger).
+#      - Flushes batches to QuestDB over HTTP POST (/write).
+#      - Because it receives NO inbound network connections, NO Kubernetes
+#        Service is required.
+#   2. 12-Factor Configuration:
+#      - Injects KAFKA_BROKER and QUESTDB_URL directly from 'gobbler-config'.
+#   3. Minimal Scratch Binary:
+#      - Runs our 7.73 MB static Go binary as unprivileged appuser (UID 10001).
+# ==============================================================================
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gobbler-persister
+  namespace: gobbler
+  labels:
+    app: gobbler-persister
+    tier: persistence
+spec:
+  # Single active worker maintaining dedicated consumer group offsets
+  replicas: 1
+
+  # Deployment Controller selector: identifies which Pods belong to this deployment
+  selector:
+    matchLabels:
+      app: gobbler-persister
+
+  # Pod Template: Defines the specification for newly created Pod replicas
+  template:
+    metadata:
+      labels:
+        app: gobbler-persister
+        tier: persistence
+    spec:
+      containers:
+        - name: persister
+          image: gobbler-persister:latest
+
+          # Crucial for local Kind: forces containerd to use the sideloaded image
+          # rather than failing when attempting to pull from Docker Hub.
+          imagePullPolicy: IfNotPresent
+
+          # Centralized configuration injection
+          envFrom:
+            - configMapRef:
+                name: gobbler-config
+
+          # Resource Management:
+          #   - requests: Reservation used by the scheduler to place the Pod.
+          #   - limits: Hard ceiling enforced by Linux cgroups.
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "32Mi"
+            limits:
+              cpu: "250m"
+              memory: "64Mi"

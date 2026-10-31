@@ -1,0 +1,66 @@
+# ==============================================================================
+# Gobbler Machine Learning Consumer: Horizontal Pod Autoscaler (HPA)
+# ==============================================================================
+# This manifest configures automated horizontal pod autoscaling for the
+# computational inference tier based on real-time CPU utilization.
+#
+# Quantitative Architectural Design:
+#   1. Partition Alignment (maxReplicas: 4):
+#      - Our Kafka topic 'market-ticks' is partitioned across exactly 4 partitions.
+#      - Under Kafka's consumer group protocol, a single partition cannot be
+#        read by more than one consumer instance in the same group.
+#      - Scaling beyond 4 replicas would result in idle Pods consuming RAM
+#        and CPU overhead while receiving zero data!
+#      - Therefore, maxReplicas is bounded strictly to 4.
+#   2. Target Utilization (60%):
+#      - Base request is 100m (0.1 core).
+#      - When order flow surges and average CPU exceeds 60m (60% of request),
+#        the HPA controller automatically triggers a scale-out event.
+#   3. Scale-Down Stabilization Window:
+#      - Enforces a 60-second cooldown period before scaling replicas down.
+#      - Prevents "flapping" (rapid oscillation between scaling up and down)
+#        during momentary microsecond dips in exchange market data.
+# ==============================================================================
+
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: gobbler-consumer-hpa
+  namespace: gobbler
+  labels:
+    app: gobbler-consumer
+    tier: autoscaling
+spec:
+  # Target the Python ML Consumer Deployment
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: gobbler-consumer
+
+  # Scale bounds: minimum 1 worker during idle, up to 4 workers (1 per Kafka partition)
+  minReplicas: 1
+  maxReplicas: 4
+
+  # Metric trigger: Average CPU utilization across active consumer Pods
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 60
+
+  # Scaling behavior: dampens rapid scale-downs during bursty traffic
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 60
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 30
+    scaleUp:
+      stabilizationWindowSeconds: 0
+      policies:
+        - type: Pods
+          value: 2
+          periodSeconds: 15

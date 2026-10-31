@@ -1,0 +1,66 @@
+# ==============================================================================
+# Gobbler Machine Learning Consumer: Deployment Manifest
+# ==============================================================================
+# This manifest orchestrates the Python analytical stream inference workers
+# responsible for real-time market anomaly detection.
+#
+# Architectural Characteristics:
+#   1. Pure Consumer / Worker Pattern:
+#      - Subscribes to 'market-ticks' within consumer group 'gobbler-ml-consumers'.
+#      - Queries Valkey for atomic check-and-set deduplication (SETNX with EX 60).
+#      - Maintains per-ticker rolling 2D statistical buffers (Z-Score).
+#      - Evaluates scikit-learn IsolationForest inference and periodic re-fitting.
+#      - Produces detected outliers to 'market-anomalies'.
+#      - Like the persister, it receives no inbound traffic; NO Service required.
+#   2. Horizontal Scalability & Partition Alignment:
+#      - Designed for horizontal scaling across Kafka's 4 partitions.
+#      - Replicas coordinate automatically via the Kafka Consumer Group protocol.
+#   3. Explicit CPU Reservation for Autoscaling:
+#      - Declaring 'requests.cpu' provides the baseline required by the
+#        Horizontal Pod Autoscaler (HPA) to calculate relative load percentages.
+# ==============================================================================
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gobbler-consumer
+  namespace: gobbler
+  labels:
+    app: gobbler-consumer
+    tier: inference
+spec:
+  # Starts with 1 replica; dynamically scaled by HPA up to 4 replicas
+  replicas: 1
+
+  selector:
+    matchLabels:
+      app: gobbler-consumer
+
+  template:
+    metadata:
+      labels:
+        app: gobbler-consumer
+        tier: inference
+    spec:
+      containers:
+        - name: consumer
+          image: gobbler-consumer:latest
+          imagePullPolicy: IfNotPresent
+
+          # Centralized configuration injection (KAFKA_BROKER, VALKEY_HOST, VALKEY_PORT)
+          envFrom:
+            - configMapRef:
+                name: gobbler-config
+
+          # Resource Management:
+          #   - cpu request (100m = 0.1 core): Crucial baseline for HPA calculation.
+          #   - memory request (128Mi): Accommodates Python 3.12, scikit-learn, NumPy,
+          #     and circular deque buffers across 10 B3 assets.
+          #   - memory limit (256Mi): Bounds memory ceiling to prevent runaway leaks.
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "256Mi"

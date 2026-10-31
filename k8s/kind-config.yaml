@@ -1,0 +1,45 @@
+# ==============================================================================
+# Gobbler Local Kubernetes Cluster: Kind Multi-Node Configuration
+# ==============================================================================
+# Topology:
+#   - 1 Control-Plane Node (API server, etcd, scheduler, ingress port mappings)
+#   - 2 Worker Nodes (Distributed compute tier for Gateway, Persister, Consumer)
+# ==============================================================================
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: gobbler-cluster
+
+nodes:
+  # ----------------------------------------------------------------------------
+  # Control Plane Node: Exposes ingress ports from host to Kubernetes NodePorts
+  # ----------------------------------------------------------------------------
+  - role: control-plane
+    extraPortMappings:
+      # Ingestion Gateway TCP Traffic (Host: 8008 -> NodePort: 30008)
+      - containerPort: 30008
+        hostPort: 8008
+        listenAddress: "127.0.0.1"
+        protocol: TCP
+
+      # Ingestion Gateway HTTP pprof Profiling (Host: 6060 -> NodePort: 30060)
+      - containerPort: 30060
+        hostPort: 6060
+        listenAddress: "127.0.0.1"
+        protocol: TCP
+
+  # ----------------------------------------------------------------------------
+  # Worker Nodes: Host application Pods managed by Deployments and HPA
+  # ----------------------------------------------------------------------------
+  - role: worker
+  - role: worker
+
+# Single-Node Topology (Default)
+# kind: Cluster
+# apiVersion: kind.x-k8s.io/v1alpha4
+# name: gobbler-cluster
+# nodes:
+#   - role: control-plane
+#     extraPortMappings:
+#       - containerPort: 30008  # NodePort inside Kubernetes
+#         hostPort: 8008        # Port on your host machine
+#         protocol: TCP

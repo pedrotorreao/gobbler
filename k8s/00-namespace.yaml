@@ -1,0 +1,19 @@
+# ==============================================================================
+# Gobbler Kubernetes: Namespace Definition
+# ==============================================================================
+# Namespaces provide a mechanism for isolating groups of resources within a
+# single Kubernetes cluster.
+#
+# Benefits:
+#   - Logical Scope: All Gobbler microservices, configs, and services reside in
+#     the 'gobbler' namespace, preventing name collisions with kube-system or other apps.
+#   - Resource Quotas & RBAC: Enables setting CPU/RAM bounds and security access controls
+#     specifically for surveillance platform workloads.
+# ==============================================================================
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: gobbler
+  labels:
+    app.kubernetes.io/name: gobbler
+    app.kubernetes.io/part-of: gobbler-surveillance-platform

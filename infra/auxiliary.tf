@@ -111,7 +111,7 @@ resource "docker_container" "redpanda" {
     "--smp", "1",
     "--memory", "1G",
     "--kafka-addr", "internal://0.0.0.0:29092,external://0.0.0.0:9092",
-    "--advertise-kafka-addr", "internal://redpanda:29092,external://localhost:9092"
+    "--advertise-kafka-addr", "internal://redpanda:29092,external://172.18.0.1:9092"
   ]
 
   restart = "unless-stopped"

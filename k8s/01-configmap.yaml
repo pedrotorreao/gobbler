@@ -1,0 +1,50 @@
+# ==============================================================================
+# Gobbler Configuration: Centralized ConfigMap
+# ==============================================================================
+# This manifest defines the centralized configuration key-value pairs shared
+# across all Gobbler microservices in the 'gobbler' namespace.
+#
+# Architectural Characteristics:
+#   1. 12-Factor App Principles (Config):
+#      - Strictly separates configuration from compiled application code.
+#      - Workloads inject these values into their environment via:
+#          envFrom:
+#            - configMapRef:
+#                name: gobbler-config
+#
+#   2. Hybrid Kind-to-Host Gateway Routing (172.18.0.1):
+#      - Gobbler runs a hybrid data plane: stateful backends (Redpanda, Valkey,
+#        QuestDB) run directly on the host Docker daemon via Terraform, while
+#        stateless microservices run inside Kind node containers.
+#      - On the Docker bridge network created by Kind ('kind'), the host machine
+#        acts as the default gateway at IP 172.18.0.1.
+#      - Pods route egress network traffic to 172.18.0.1 to access host-bound services.
+# ==============================================================================
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: gobbler-config
+  namespace: gobbler
+  labels:
+    app.kubernetes.io/name: gobbler-config
+    app.kubernetes.io/part-of: gobbler-surveillance-platform
+data:
+  # Redpanda / Kafka broker endpoint (Host external listener on port 9092)
+  KAFKA_BROKER: "172.18.0.1:9092"
+
+  # QuestDB HTTP Influx Line Protocol (ILP) write endpoint on host port 9000
+  QUESTDB_URL: "http://172.18.0.1:9000/write"
+
+  # Valkey in-memory cache host and port for atomic SETNX deduplication
+  VALKEY_HOST: "172.18.0.1"
+  VALKEY_PORT: "6379"
+
+  # Ingestion Gateway network listener configuration:
+  # Must bind to 0.0.0.0 inside the container to accept routed traffic from the NodePort Service
+  INGESTION_GATEWAY_ADDR: "0.0.0.0"
+  INGESTION_GATEWAY_PORT: "8008"
+
+  # Go runtime diagnostic pprof endpoint (exposes goroutine, heap, and CPU profiles)
+  PPROF_ADDR: "0.0.0.0:6060"
+
