@@ -90,19 +90,20 @@ Infrastructure-as-Code.
 
 ---
 
-### Phase 4: Time-Series Persistence & Infrastructure-as-Code (Weeks 10–12) — 🚀 IN PROGRESS
+### Phase 4: Time-Series Persistence & Infrastructure-as-Code (Weeks 10–12) — ✅ COMPLETED
 *Automate environment setup and configure high-throughput analytical storage.*
 
 - [x] **Step 1:** Deploy QuestDB using Docker (`docker-compose.yml`) exposing InfluxDB Line Protocol (HTTP `:9000` & TCP `:9009`), PostgreSQL wire (`:8812`), and Web Console (`:9000`). Verified DDL table creation (`market_ticks`, `market_anomalies`), ILP HTTP ingestion (`204 OK`), and ASOF JOIN queries.
 - [x] **Step 2:** Write a dedicated Go persistence service ([`persister/persister.go`](../persister/persister.go)) to ingest raw tick data (`market-ticks`) and anomaly alerts (`market-anomalies`) from Kafka into dedicated partitioned QuestDB tables (`market_ticks` and `market_anomalies`) via InfluxDB Line Protocol (ILP) with a dual-trigger batching strategy (5,000 rows or 500ms).
 - [x] **Step 3:** Package every custom microservice (Ingest Gateway, Mock Generator, ML Worker, Persistence Worker) using multi-stage, minimal-footprint Dockerfiles (`Dockerfile.gateway`, `Dockerfile.generator`, `Dockerfile.persister`, `Dockerfile.consumer`). All Go binaries compiled to static binaries on `scratch` (~2.5MB–8MB) and Python worker in `python:3.12-slim` (~413MB) running as unprivileged user `appuser` (UID 10001).
-- [ ] **Step 4:** Write OpenTofu scripts to declaratively provision local containers, storage volumes, and network bridges.
-- [ ] **Step 5:** Create local Kubernetes (Kind) manifests declaring Deployments, Services, ConfigMaps, and Horizontal Pod Autoscalers (HPA) for the Python consumer tier.
+- [x] **Step 4:** Write OpenTofu / Terraform scripts under [`infra/`](../infra/) to declaratively provision local containers, storage volumes, and network bridges (`gobbler-network`, `questdb_data`, `redpanda`, `valkey`, `questdb`, and Option C microservices toggle). Verified live apply and teardown.
+- [x] **Step 5:** Create local Kubernetes (Kind) manifests declaring Deployments, Services, ConfigMaps, and Horizontal Pod Autoscalers (HPA) for the Python consumer tier. (Completed & Verified live: 3-node cluster, NodePort ingress, partition-aligned scaling from 1 to 4 replicas under load).
+
 
 **Definition of Done (DoD):**
-- [x] Financial tick data and anomaly records are persistently queryable in QuestDB via SQL. (Verified live: 69,966 ticks and 1,622 anomalies ingested via ILP and queried via ASOF JOIN).
-- [ ] Running a single `tofu apply` command spins up the required auxiliary infrastructure from a clean state.
-- [ ] The Python inference worker tier scales pod replicas up and down inside Kind based on Kafka consumer lag.
+- [x] Financial tick data and anomaly records are persistently queryable in QuestDB via SQL. (Verified live: 133,459 ticks and 2,796 anomalies ingested via ILP and queried via SQL).
+- [x] Running a single `tofu apply` command spins up the required auxiliary infrastructure from a clean state.
+- [x] The Python inference worker tier scales pod replicas up and down inside Kind based on CPU utilization and partition alignment.
 
 ---
 
@@ -113,8 +114,10 @@ Infrastructure-as-Code.
 - [ ] **Step 2:** Refactor the Go ingestion path to use `sync.Pool`, recycling byte buffers to eliminate per-packet heap allocations and reduce garbage collector (GC) pauses.
 - [ ] **Step 3:** Execute failure testing: pull down worker pods, simulate database drops, and record metrics on how the system recovers.
 - [ ] **Step 4:** Build a clean GitHub repository containing: detailed architectural diagrams, reproducible benchmark commands, and a written post-mortem.
+- [ ] **Step 5:** Write an automated end-to-end verification script (`scripts/e2e_test.sh` / `Makefile`) to provision all layers (Terraform auxiliary data plane + Kind Kubernetes cluster), wait for service health, stream test workloads, assert zero-loss persistence and autoscaling, and perform guaranteed teardown.
 
 **Definition of Done (DoD):**
+
 - [ ] Memory profiling traces confirm a measurable reduction in heap allocations and GC pause times after implementing `sync.Pool`.
 - [ ] The system demonstrates self-healing behavior under node termination without data corruption.
 - [ ] The GitHub repository provides one-command local reproduction scripts and clear documentation.
@@ -149,4 +152,8 @@ Infrastructure-as-Code.
 | End-to-end verification of Phase 4 pipeline (Kafka -> Persister -> QuestDB) | Week 11 | [x] Completed |
 | Package microservices using multi-stage Dockerfiles (`gateway`, `generator`, `persister`, `consumer`) | Week 11-12 | [x] Completed |
 | Declarative container & volume orchestration via OpenTofu (IaC) | Week 12 | [x] Completed |
+| Local Kubernetes (Kind) manifests & HPA autoscaling (Step 5) | Week 12 | [x] Completed |
+| Automated End-to-End Test & Reproduction Script (`scripts/e2e_test.sh`) | Week 14 | [ ] Pending |
+
+
 

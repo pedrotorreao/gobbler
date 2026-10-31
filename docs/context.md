@@ -14,6 +14,7 @@ Gobbler is a distributed real-time financial market surveillance and anomaly det
 * **Valkey Deep Dive**: [`valkey.md`](valkey.md)
 * **QuestDB Deep Dive**: [`questdb.md`](questdb.md)
 * **Terraform / IaC Deep Dive**: [`terraform.md`](terraform.md)
+* **Kubernetes / Kind Deep Dive**: [`kubernetes.md`](kubernetes.md)
 
 ---
 
@@ -102,6 +103,16 @@ Gobbler is a distributed real-time financial market surveillance and anomaly det
      - Full-Stack (`true`): Provisions `gobbler-gateway`, `gobbler-persister`, and `gobbler-consumer` containers with 12-factor environment variables and DAG dependencies (`depends_on`).
    * **Output Contracts ([`infra/outputs.tf`](../infra/outputs.tf))**: Exports connection endpoints and dynamic gateway status (`localhost:8008` vs disabled).
    * **Live Verification**: `terraform apply` successfully provisioned all resources; verified container health, Redpanda `rpk cluster info`, Valkey `PONG`, and QuestDB SQL REST API (`/exec?query=show+tables`).
+5. **Local Kubernetes (Kind) Orchestration & Autoscaling (Step 5 - Complete & Verified)**:
+   * **Multi-Node Cluster ([`k8s/kind-config.yaml`](../k8s/kind-config.yaml))**: 3 nodes (1 control-plane, 2 workers) with `extraPortMappings` for `30008 -> 8008` (TCP ingress) and `30060 -> 6060` (pprof).
+   * **Hybrid Ingress Architecture**:
+     - `gobbler-gateway`: `Deployment` (50m CPU / 32Mi RAM request) + `NodePort Service` exposing ports 30008 and 30060.
+     - `gobbler-persister`: Pure background consumer `Deployment` (50m CPU / 32Mi RAM request). No Service required.
+     - `gobbler-consumer`: Python ML analytical `Deployment` (100m CPU / 128Mi RAM request).
+   * **Centralized Configuration ([`k8s/01-configmap.yaml`](../k8s/01-configmap.yaml))**: Injected via `envFrom.configMapRef` with host gateway routing (`172.18.0.1`).
+   * **Kafka Advertised Listener Fix**: Configured Redpanda's external advertised address as `172.18.0.1:9092` in [`infra/auxiliary.tf`](../infra/auxiliary.tf) to eliminate the Kafka advertised listener trap where pods resolved `localhost` internally.
+   * **Horizontal Pod Autoscaler ([`k8s/05-hpa.yaml`](../k8s/05-hpa.yaml))**: Autoscaling targeted at `gobbler-consumer` (min 1, max 4, 60% CPU utilization).
+   * **Live Load & Scalability Verification**: Ingested streaming load via host generator; HPA detected 501% CPU utilization and scaled consumer replicas from 1 to 4 (perfect 1:1 alignment across all 4 Kafka partitions); persister flushed **133,459 ticks** and **2,796 anomalies** to QuestDB with 0 lag across all partitions.
 
 ---
 
@@ -188,7 +199,8 @@ Gobbler is a distributed real-time financial market surveillance and anomaly det
 │   ├── questdb.md               # QuestDB concepts, ILP format, table partitioning & SQL reference
 │   ├── redpanda.md              # Redpanda concepts, CLI guide & architecture reference
 │   ├── terraform.md             # Terraform & OpenTofu concepts, Docker provider & CLI guide
-│   └── valkey.md                # Valkey concepts, Idempotent Consumer & CLI guide
+│   ├── valkey.md                # Valkey concepts, Idempotent Consumer & CLI guide
+│   └── kubernetes.md            # Kubernetes & Kind orchestration guide, primitives & HPA
 ├── generator/
 │   └── generator.go             # Package main - standalone exchange simulator (10 B3 assets)
 ├── go.mod                       # Module github.com/pedrotorreao/gobbler
@@ -207,4 +219,7 @@ Gobbler is a distributed real-time financial market surveillance and anomaly det
 * [x] **Step 2**: Implement dedicated Go persistence service ([`persister/persister.go`](../persister/persister.go)) subscribing to `market-ticks` and `market-anomalies`, formatting ILP batches (5,000 rows or 500ms), and streaming to QuestDB with post-flush offset commits.
 * [x] **Step 3**: Package every custom microservice using multi-stage, minimal-footprint Dockerfiles ([`Dockerfile.gateway`](../Dockerfile.gateway), [`Dockerfile.generator`](../Dockerfile.generator), [`Dockerfile.persister`](../Dockerfile.persister), [`Dockerfile.consumer`](../Dockerfile.consumer)). Verified all Go binaries on `scratch` (~2.5MB–8MB) and Python on `python:3.12-slim` (~413MB) running as unprivileged user `appuser` (UID 10001).
 * [x] **Step 4**: Declarative container, network, and volume orchestration via **Terraform / OpenTofu** in [`infra/`](../infra/). Verified auxiliary data plane live apply, dual-listener Kafka architecture, and Option C microservice toggle.
-* **Next Steps**: Step 5 (Kind Kubernetes cluster manifests, Helm/Kustomize, and HPA).
+* [x] **Step 5**: Local Kubernetes (Kind) manifests declaring Deployments, NodePort Ingress, ConfigMaps, and Horizontal Pod Autoscalers (HPA) for the Python consumer tier ([`k8s/`](../k8s/)). Live verified multi-node cluster, partition-aligned horizontal scaling (1 to 4 replicas), and zero-loss persistence (133k+ ticks).
+* **Next Steps**: Phase 5 (High-Load Profiling, Chaos Engineering, and Memory Pool Refactoring via `sync.Pool`).
+
+
