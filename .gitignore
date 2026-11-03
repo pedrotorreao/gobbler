@@ -58,3 +58,6 @@ crash.*.log
 *.tfplan
 *tfplan*
 # Note: .terraform.lock.hcl is intentionally NOT ignored (HashiCorp recommends committing it)
+
+*.gz
+bin/

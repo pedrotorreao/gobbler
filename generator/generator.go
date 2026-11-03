@@ -9,6 +9,7 @@
 package main
 
 import (
+	"bufio"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -90,19 +91,34 @@ func main() {
 	// DESIGN PATTERN: A single dedicated goroutine drains tickStream and writes to net.Conn.
 	// This avoids data races and buffer corruption since net.Conn writes are not inherently thread-safe across concurrent routines.
 	go func() {
-		for tick := range tickStream {
-			payload, err := json.Marshal(tick)
-			if err != nil {
-				continue
-			}
+		bufferedWriter := bufio.NewWriterSize(conn, 64*1024) // 64*1024 = 65536 bytes (64KB): MTU for loopback interface (local)
+		ticker := time.NewTicker(5 * time.Millisecond)       // Periodic flush to prevent stale data
+		defer ticker.Stop()
 
-			// Frame message with a trailing newline ('\n') so the TCP scanner can delimit lines.
-			payload = append(payload, '\n')
+		for {
+			select {
+			case tick, ok := <-tickStream:
+				if !ok {
+					bufferedWriter.Flush()
+					return
+				}
 
-			_, err = conn.Write(payload)
-			if err != nil {
-				log.Printf("Connection severed by server: %v\n", err)
-				return
+				payload, err := json.Marshal(tick)
+				if err != nil {
+					continue
+				}
+
+				// Frame message with a trailing newline ('\n') so the TCP scanner can delimit lines.
+				payload = append(payload, '\n')
+				bufferedWriter.Write(payload)
+
+				// Auto-flush if buffer is getting full
+				if bufferedWriter.Available() < 1024 {
+					bufferedWriter.Flush()
+				}
+
+			case <-ticker.C:
+				bufferedWriter.Flush()
 			}
 		}
 	}()
@@ -116,43 +132,46 @@ func main() {
 func simulateTicker(state TickerState, out chan<- MarketTick) {
 	// Initialize a local random number generator with a nanosecond seed per goroutine.
 	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
+	const batchSize = 60 // Emits 60 ticks per burst (~60,000 ticks/sec across 10 tickers)
 
 	for {
-		// ---------------------------------------------------------------------
-		// Price Calculation: Random Walk (-0.15% to +0.15% fluctuation per tick)
-		// ---------------------------------------------------------------------
-		driftPercent := (rng.Float64() - 0.5) * 0.003
-		state.CurrentPrice += state.CurrentPrice * driftPercent
-		if state.CurrentPrice < 0.01 {
-			state.CurrentPrice = 0.01 // Floor price at 1 cent
-		}
-
-		volume := rng.Intn(500) + 100 // Standard trade sizes (100 - 600 shares)
-		isAnomaly := false
-
-		// ---------------------------------------------------------------------
-		// Anomaly Injection: 0.1% probability of flash crash or surge
-		// ---------------------------------------------------------------------
-		if rng.Float64() < 0.001 {
-			isAnomaly = true
-			if rng.Float64() < 0.5 {
-				state.CurrentPrice *= 0.85 // 15% sudden flash crash
-			} else {
-				state.CurrentPrice *= 1.15 // 15% sudden price pump
+		for i := 0; i < batchSize; i++ {
+			// ---------------------------------------------------------------------
+			// Price Calculation: Random Walk (-0.15% to +0.15% fluctuation per tick)
+			// ---------------------------------------------------------------------
+			driftPercent := (rng.Float64() - 0.5) * 0.003
+			state.CurrentPrice += state.CurrentPrice * driftPercent
+			if state.CurrentPrice < 0.01 {
+				state.CurrentPrice = 0.01 // Floor price at 1 cent
 			}
-			volume *= 20 // 20x volume spike accompanying anomaly
+
+			volume := rng.Intn(500) + 100 // Standard trade sizes (100 - 600 shares)
+			isAnomaly := false
+
+			// ---------------------------------------------------------------------
+			// Anomaly Injection: 0.1% probability of flash crash or surge
+			// ---------------------------------------------------------------------
+			if rng.Float64() < 0.001 {
+				isAnomaly = true
+				if rng.Float64() < 0.5 {
+					state.CurrentPrice *= 0.85 // 15% sudden flash crash
+				} else {
+					state.CurrentPrice *= 1.15 // 15% sudden price pump
+				}
+				volume *= 20 // 20x volume spike accompanying anomaly
+			}
+
+			out <- MarketTick{
+				Ticker:      state.Symbol,
+				Price:       float64(int(state.CurrentPrice*100)) / 100, // Round price to 2 decimal places
+				Volume:      volume,
+				TimestampNs: int64(time.Now().UnixNano()),
+				IsAnomaly:   isAnomaly,
+			}
 		}
 
-		out <- MarketTick{
-			Ticker:      state.Symbol,
-			Price:       float64(int(state.CurrentPrice*100)) / 100, // Round price to 2 decimal places
-			Volume:      volume,
-			TimestampNs: int64(time.Now().UnixNano()),
-			IsAnomaly:   isAnomaly,
-		}
-
-		// Throttle frequency: sleep 500 microseconds (~2,000 ticks/sec per ticker)
-		time.Sleep(500 * time.Microsecond)
+		// Throttle frequency: burst 50 ticks every 10 milliseconds (10,000 ticks/sec per ticker)
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 

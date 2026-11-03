@@ -45,6 +45,13 @@ type MarketTick struct {
 // unmarshaled and processed across all active worker goroutines since startup.
 var totalProcessed uint64
 
+var bufferPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, 0, 512)
+		return &b
+	},
+}
+
 func main() {
 	// -------------------------------------------------------------------------
 	// Step 1: Signal Interception & Context Lifecycle Setup
@@ -60,7 +67,7 @@ func main() {
 	// Allocate a bounded buffered channel to hold raw byte payloads awaiting processing.
 	// Bounding the capacity (50,000) prevents unbounded memory growth under traffic spikes.
 	const queueCapacity = 50000
-	jobQueue := make(chan []byte, queueCapacity)
+	jobQueue := make(chan *[]byte, queueCapacity)
 
 	// Configure a thread-safe, batched Kafka writer targeting local Redpanda.
 	// Balancer: &kafka.Hash{} hashes the message key (asset ticker) to ensure
@@ -73,6 +80,18 @@ func main() {
 		BatchTimeout: 5 * time.Millisecond,                                // Flush interval threshold to minimize streaming latency during low volume
 		RequiredAcks: kafka.RequireOne,                                    // Await confirmation from the partition leader before considering write successful
 		WriteTimeout: 2 * time.Second,                                     // Fail-safe deadline to prevent worker goroutines from blocking on dead brokers
+		Async:        true,
+		Completion: func(messages []kafka.Message, err error) {
+			if err != nil {
+				log.Printf("[WARNING] Kafka batch delivery failed: %v\n", err)
+			}
+			// Iterate by index to avoid copying the kafka.Message struct on each loop iteration:
+			for i := range messages {
+				if bufPtr, ok := messages[i].WriterData.(*[]byte); ok && bufPtr != nil {
+					bufferPool.Put(bufPtr)
+				}
+			}
+		},
 	}
 
 	// Scale worker goroutines to match the available logical CPU cores for CPU-bound JSON parsing.
@@ -199,7 +218,7 @@ func main() {
 
 // handleConnection streams raw bytes from a single TCP client connection, frames payloads
 // on newline ('\n') boundaries using bufio.Scanner, and dispatches payload copies into jobQueue.
-func handleConnection(conn net.Conn, jobQueue chan<- []byte) {
+func handleConnection(conn net.Conn, jobQueue chan<- *[]byte) {
 	remoteAddr := conn.RemoteAddr().String()
 	fmt.Printf("[+] New connection established: %s\n", remoteAddr)
 
@@ -209,15 +228,13 @@ func handleConnection(conn net.Conn, jobQueue chan<- []byte) {
 	for scanner.Scan() {
 		rawBytes := scanner.Bytes()
 
-		// CRITICAL MEMORY PATTERN:
-		// scanner.Bytes() returns a slice pointing to bufio's internal buffer, which is overwritten
-		// on the subsequent Scan() call. We MUST allocate a distinct copy before passing it across channels.
-		payloadCopy := make([]byte, len(rawBytes))
-		copy(payloadCopy, rawBytes)
-
-		// Push to the worker queue. If jobQueue capacity (50,000) is reached, this line blocks,
+		// 1. Borrow a buffer pointer from the pool:
+		bufPtr := bufferPool.Get().(*[]byte)
+		// 2. Reset slice length to 0 while preserving capacity, the copy bytes:
+		*bufPtr = append((*bufPtr)[:0], rawBytes...)
+		// 3. Dispatch the pointer to the worker channel/queue. If jobQueue capacity (50,000) is reached, this line blocks,
 		// triggering TCP socket backpressure back to the sending client.
-		jobQueue <- payloadCopy
+		jobQueue <- bufPtr
 	}
 
 	if err := scanner.Err(); err != nil {
@@ -228,28 +245,31 @@ func handleConnection(conn net.Conn, jobQueue chan<- []byte) {
 // worker is a consumer routine in the worker pool. It reads raw byte payloads from jobs,
 // unmarshals them into MarketTick structs, publishes them to Redpanda partitioned by ticker symbol,
 // updates global throughput metrics, and flags anomalies.
-func worker(id int, jobs <-chan []byte, wg *sync.WaitGroup, writer *kafka.Writer) {
+func worker(id int, jobs <-chan *[]byte, wg *sync.WaitGroup, writer *kafka.Writer) {
 	defer wg.Done()
 
 	// Range loop continuously receives jobs until jobs channel is closed AND fully drained.
-	for payload := range jobs {
+	for bufPtr := range jobs {
 		var tick MarketTick
-		if err := json.Unmarshal(payload, &tick); err != nil {
-			continue // In production, route corrupted payloads to a Dead Letter Queue (DLQ)
+		if err := json.Unmarshal(*bufPtr, &tick); err != nil {
+			bufferPool.Put(bufPtr) // Recycle before skipping
+			continue               // In production, route corrupted payloads to a Dead Letter Queue (DLQ)
 		}
 
 		// Construct Kafka message:
 		// - Key: Ticker symbol (hashed by &kafka.Hash{} to guarantee strict per-asset FIFO ordering)
 		// - Value: Reuses validated JSON byte slice (zero re-serialization / allocation overhead)
 		msg := kafka.Message{
-			Key:   []byte(tick.Ticker),
-			Value: payload,
+			Key:        []byte(tick.Ticker),
+			Value:      *bufPtr,
+			WriterData: bufPtr,
 		}
 
 		// Dispatch message to Redpanda broker with exponential backoff retry resilience.
 		// Uses context.Background() so in-flight items drain successfully even if root ctx is canceled.
 		if !dispatchMsg(id, context.Background(), msg, writer) {
-			return // Gateway writer is closed during shutdown; terminate worker
+			bufferPool.Put(bufPtr) // Recycle before exiting
+			return                 // Gateway writer is closed during shutdown; terminate worker
 		}
 
 		// Increment atomic throughput metric counter

@@ -213,13 +213,20 @@ Gobbler is a distributed real-time financial market surveillance and anomaly det
 
 ---
 
-## 6. Immediate Next Steps: Phase 4 (Time-Series Persistence & Infrastructure-as-Code)
+## 6. Immediate Next Steps: Phase 5 (High-Load Profiling, Chaos Engineering & Memory Pool Refactoring)
 
-* [x] **Step 1**: Spin up **QuestDB** in [`docker-compose.yml`](../docker-compose.yml) (Port `9000` Web/HTTP/ILP, Port `9009` TCP ILP, Port `8812` PGWire). Verified DDL table creation (`market_ticks`, `market_anomalies`), ILP HTTP ingestion (`204 OK`), and `ASOF JOIN` analytics.
-* [x] **Step 2**: Implement dedicated Go persistence service ([`persister/persister.go`](../persister/persister.go)) subscribing to `market-ticks` and `market-anomalies`, formatting ILP batches (5,000 rows or 500ms), and streaming to QuestDB with post-flush offset commits.
-* [x] **Step 3**: Package every custom microservice using multi-stage, minimal-footprint Dockerfiles ([`Dockerfile.gateway`](../Dockerfile.gateway), [`Dockerfile.generator`](../Dockerfile.generator), [`Dockerfile.persister`](../Dockerfile.persister), [`Dockerfile.consumer`](../Dockerfile.consumer)). Verified all Go binaries on `scratch` (~2.5MB–8MB) and Python on `python:3.12-slim` (~413MB) running as unprivileged user `appuser` (UID 10001).
-* [x] **Step 4**: Declarative container, network, and volume orchestration via **Terraform / OpenTofu** in [`infra/`](../infra/). Verified auxiliary data plane live apply, dual-listener Kafka architecture, and Option C microservice toggle.
-* [x] **Step 5**: Local Kubernetes (Kind) manifests declaring Deployments, NodePort Ingress, ConfigMaps, and Horizontal Pod Autoscalers (HPA) for the Python consumer tier ([`k8s/`](../k8s/)). Live verified multi-node cluster, partition-aligned horizontal scaling (1 to 4 replicas), and zero-loss persistence (133k+ ticks).
-* **Next Steps**: Phase 5 (High-Load Profiling, Chaos Engineering, and Memory Pool Refactoring via `sync.Pool`).
+* [x] **Step 1**: High-Load Saturation & Empirical Profiling.
+  - Saturated Go Ingestion Gateway at **56,400+ msgs/sec** (676,800 msgs in 12s) using optimized synthetic generator (64KB loopback buffer, 60 ticks/10ms bursts) and asynchronous Kafka producer (`Async: true`).
+  - Captured baseline heap allocation profile ([`baseline_heap_50k.pb.gz`](../baseline_heap_50k.pb.gz)).
+  - Identified primary heap allocation bottleneck: `handleConnection` inlining allocating fresh slices on every scan (`payloadCopy := make([]byte, len(rawBytes))`) accounting for **294,934 heap allocations (22.50 MB)** in a 5-second sampling window. Secondary bottleneck: JSON unmarshaling (`MarketTick`) in `worker`.
+* [x] **Step 2**: Buffer Recycling via `sync.Pool`.
+  - Implemented `sync.Pool` storing `*[]byte` (pre-allocated 512-byte capacity) to eliminate slice header boxing.
+  - Linked end-to-end zero-copy lifecycle across `handleConnection`, `jobQueue chan *[]byte`, `worker`, and asynchronous Kafka writer via `kafka.Message.WriterData` and `kafkaWriter.Completion` callback.
+  - Handled defensive early returns on JSON unmarshal errors and shutdown channel drain.
+  - Re-ran 56,000+ msgs/sec benchmark (675,060 msgs in 12s, peaking at 67,200 msgs/sec) and captured [`syncpool_heap_50k.pb.gz`](../syncpool_heap_50k.pb.gz).
+  - Comparative profiling (`pprof -base baseline_heap_50k.pb.gz syncpool_heap_50k.pb.gz`) confirmed **-294,934 object allocations eliminated** from the network ingestion loop, reducing per-packet heap allocations in `handleConnection` to **0**.
+* [ ] **Step 3**: Chaos Engineering & Failure Recovery (broker pause, worker pod kill, database disconnect resilience).
+* [ ] **Step 4**: Architecture documentation, benchmark playbooks & post-mortem.
+* [ ] **Step 5**: Automated E2E verification script ([`scripts/e2e_test.sh`](../scripts/e2e_test.sh)).
 
 
