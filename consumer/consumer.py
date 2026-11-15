@@ -106,8 +106,11 @@ def run_consumer():
 
     producer = Producer(conf_producer)
 
-    print("[STARTUP] Consumer subscribed to 'market-ticks' topic.")
-    print("[STARTUP] Awaiting streaming financial ticks from Redpanda...")
+    worker_id = os.environ.get("WORKER_ID", "WORKER-1")
+    ticks_processed = 0
+
+    print(f"[STARTUP] Consumer {worker_id} subscribed to 'market-ticks' topic.")
+    print(f"[STARTUP] Consumer {worker_id} awaiting streaming financial ticks from Redpanda...")
     # Initialized once at startup so circular buffers persist across iterations:
     detector = RollingZScoreDetector(
         window_size=100,
@@ -160,16 +163,17 @@ def run_consumer():
                 # Duplicate message detected (caused by producer retry or consumer rebalance)
                 # 1. Skip expensive analytical and ML inference
                 # 2. Acknowledge offset to Kafka so the broker advances beyond the duplicate
-                print(f"[DEDUP] Duplicate dropped: {dedup_key} (Partition {msg.partition()} @ Offset {msg.offset()})")
+                print(f"[{worker_id} DEDUP] Duplicate dropped: {dedup_key} (Partition {msg.partition()} @ Offset {msg.offset()})")
                 consumer.commit(message=msg, asynchronous=False)
                 continue
 
             # ------------------------------------------------------------------
-            # Step 4: Stream Inference & Anomaly Detection
+            # Step 4: Two-Tier Real-Time Anomaly Inference
             # ------------------------------------------------------------------
+            ticks_processed += 1
             is_anomaly, z_score, ml_score, anomaly_tier = detector.evaluate(ticker, price, volume)
             if is_anomaly:
-                print(f"[ANOMALY ALERT] {ticker} @ ${price:.2f} (Vol: {volume}, Z-Score: {z_score:+.2f}, ML-Score: {ml_score:.3f})")
+                print(f"[{worker_id} ANOMALY ALERT] {ticker} @ ${price:.2f} (Vol: {volume}, Z-Score: {z_score:+.2f}, ML-Score: {ml_score:.3f})")
                 # ------------------------------------------------------------------
                 # Step 5: Anomaly Event Emission
                 # ------------------------------------------------------------------
@@ -194,13 +198,21 @@ def run_consumer():
                 # callback queue. Prevents the internal buffer from filling during a
                 # sustained anomaly burst without introducing blocking latency.
                 producer.poll(0)
-            else:
-                print(f"Received: Ticker={ticker}, Price={price}, Timestamp={timestamp}")
+            elif ticks_processed % 1000 == 0:
+                # LEARNING NOTE — Stdout Log Throttling at High Throughput:
+                # Calling print() on every single normal tick invokes a synchronous
+                # OS write() syscall to stdout (and container JSON log drivers),
+                # which severely bottlenecks throughput at 50k+ msgs/sec. Logging
+                # every 1,000th normal tick preserves observability with ~0% I/O overhead.
+                print(f"[{worker_id}] Ingested {ticks_processed} ticks | Latest: {ticker} @ ${price:.2f}")
 
             # ------------------------------------------------------------------
-            # Step 5: Explicit Manual Offset Commit
+            # Step 6: Explicit Manual Offset Commit
             # ------------------------------------------------------------------
-            # Persist offset commit to Redpanda's internal '__consumer_offsets' topic
+            # Persist offset commit to Redpanda's internal '__consumer_offsets' topic.
+            # If this worker crashes with SIGKILL (kill -9) before this line executes,
+            # the surviving consumer group replica will re-fetch the uncommitted tick
+            # and drop it via Step 3's Valkey SETNX check (effectively-once processing).
             consumer.commit(message=msg, asynchronous=False)
 
     finally:

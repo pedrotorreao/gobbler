@@ -197,18 +197,28 @@ class RollingZScoreDetector:
         tier1_anomaly = (abs(z_price) > self.z_threshold) and (pct_change >= self.min_pct_change)
 
         # ----------------------------------------------------------------------
-        # 4. Calculate Isolation Forest Anomaly Score
+        # 4. Calculate Isolation Forest Anomaly Score (Tier 2 — Unsupervised ML)
         # ----------------------------------------------------------------------
         ml_scored_sample = 0.0
 
         if self.tick_counters[ticker] >= self.ml_score_delay:
-            # 1. Fit the model as soon as the warm up period for the ML layer concludes or
-            #    periodically re-fit model if needed (every refit_interval ticks)
+            # 1. Fit the model as soon as the warm-up period (ml_score_delay=500) concludes,
+            #    and periodically re-fit every refit_interval (100) ticks to adapt to regime drift.
+            #    LEARNING NOTE — scikit-learn Fitted Attribute Convention ('estimators_'):
+            #    In scikit-learn, attributes ending with a trailing underscore (such as
+            #    'estimators_') are created ONLY after .fit() has been called at least once.
+            #    Checking 'not hasattr(self.models[ticker], "estimators_")' is the idiomatic
+            #    O(1) way to verify whether this ticker's IsolationForest is still unfitted.
             history_normalized = (data - means) / stds_effective
             if (not hasattr(self.models[ticker], "estimators_")) or (self.tick_counters[ticker] % self.refit_interval == 0):
                 self.models[ticker].fit(np.array(history_normalized))
         
-            # 2. Score sample: x > -0.45 = normal, -0.55 <= x <= -0.45 = border, <= -0.55 = anomaly
+            # 2. Score sample in normalized 2D [z_price, z_volume] space:
+            #    score_samples() returns the opposite of the anomaly score defined in the
+            #    original Isolation Forest paper (Liu et al., 2008):
+            #      > -0.45        : Dense normal cluster (long average tree path length)
+            #      -0.45 to -0.65 : Borderline transition zone
+            #      < -0.65        : Geometrically isolated outlier (short average path length)
             price_normalized = (price - means[0]) / stds_effective[0]
             volume_normalized = (volume - means[1]) / stds_effective[1]
             ml_scored_sample = self.models[ticker].score_samples([[price_normalized, volume_normalized]])[0]
