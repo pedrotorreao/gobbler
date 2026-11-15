@@ -4,51 +4,82 @@ Gobbler is a high-throughput, distributed market surveillance and streaming anal
 
 ```mermaid
 flowchart TD
-    subgraph Client["1. Market Simulation Layer"]
-        Gen["Synthetic Load Generator<br/>(10 Assets, Random-Walk, Injected Spikes)"]
+    subgraph Client["1. Market Simulation Layer (Host / Container)"]
+        Gen["Synthetic Load Generator<br/>(10 B3 Assets, 64KB bufio.Writer, 60-Tick / 10ms Bursts)"]
     end
 
-    subgraph K8s["2. Kubernetes (Kind) Cluster & Ingress Tier (Namespace: gobbler)"]
-        NodePort["NodePort Ingress<br/>Host: 8008 ➔ Node: 30008<br/>Host: 6060 ➔ Node: 30060"]
-        GW["gobbler-gateway Pod<br/>(Go static binary on scratch, 8.09 MB)"]
-        Pool["Bounded Worker Pool<br/>(runtime.NumCPU() workers, 50k jobQueue)"]
+    subgraph Compute["2. Compute & Ingress Tier (Kind K8s / Terraform Docker / Host)"]
+        NodePort["TCP Ingress & Diagnostics<br/>Host: 8008 ➔ NodePort: 30008 (Ticks)<br/>Host: 6060 ➔ NodePort: 30060 (pprof)"]
+        GW["gobbler-gateway<br/>(Go Static Binary on scratch, 8.09 MB)"]
+        SyncPool["Zero-Allocation Buffer Pool<br/>(sync.Pool storing *[]byte, 512B Cap)"]
+        Pool["Bounded Worker Pool & Async Producer<br/>(runtime.NumCPU() Workers, 50k jobQueue, Async: true)"]
         Pprof["Diagnostic Server<br/>(net/http/pprof on :6060)"]
         HPA["Horizontal Pod Autoscaler (HPA)<br/>(CPU Target: 60%, Min: 1, Max: 4 Replicas)"]
-        Consumer["gobbler-consumer Pod(s)<br/>(Python 3.12 / scikit-learn / NumPy)"]
-        Persist["gobbler-persister Pod<br/>(Go static binary on scratch, 7.73 MB)"]
+        Consumer["gobbler-consumer Pod(s)<br/>(Python 3.12: Tier 1 Z-Score + Tier 2 IsolationForest)"]
+        Persist["gobbler-persister<br/>(Go Static Binary on scratch, 7.73 MB<br/>Dual Groups + flushWithRetry Backoff)"]
     end
 
-    subgraph Aux["3. Auxiliary Data Plane (Terraform / Host Docker)"]
-        RP["Redpanda Broker (:9092)<br/>market-ticks (4P) & market-anomalies (4P)"]
+    subgraph Aux["3. Auxiliary Data Plane (Terraform / Docker Bridge: gobbler-network)"]
+        RP["Redpanda Broker (:9092 / :29092)<br/>market-ticks (4P) & market-anomalies (4P)"]
         VK["Valkey Distributed Cache (:6379)<br/>Atomic SETNX Deduplication (TTL 60s)"]
         QDB["QuestDB Columnar Time-Series (:9000)<br/>market_ticks & market_anomalies (PARTITION BY DAY)"]
     end
 
-    Gen -->|Raw TCP Stream<br/>~50k msgs/sec| NodePort
+    Gen -->|"Raw TCP Stream<br/>56,400+ msgs/sec"| NodePort
     NodePort --> GW
-    GW --> Pool
+    SyncPool -->|"1. bufferPool.Get()"| GW
+    GW -->|"2. chan *[]byte"| Pool
+    Pool -.->|"4. Completion(WriterData)<br/>bufferPool.Put()"| SyncPool
     GW -.-> Pprof
-    Pool -->|Keyed Balancer: FNV-1a Hash<br/>Host Gateway: 172.18.0.1:9092| RP
+    Pool -->|"3. FNV-1a Key Hash<br/>BatchSize: 100 / Timeout: 5ms"| RP
 
-    RP -->|market-ticks Stream<br/>Group: gobbler-ml-consumers| Consumer
-    HPA -.->|Scales Replicas 1 to 4<br/>Partition-Aligned| Consumer
-    Consumer <-->|Atomic SETNX Check & Set| VK
-    Consumer -->|Emit Outlier Events<br/>market-anomalies| RP
+    RP -->|"market-ticks (4P)<br/>Group: gobbler-ml-consumers"| Consumer
+    HPA -.->|"Scales Replicas 1 ➔ 4<br/>1:1 Partition-Aligned"| Consumer
+    Consumer <-->|"Atomic SETNX (EX 60)"| VK
+    Consumer -->|"Emit Outlier Events<br/>market-anomalies (4P)"| RP
 
-    RP -->|market-ticks & market-anomalies| Persist
-    Persist -->|Dual-Trigger Batches: 5k rows / 500ms<br/>ILP over HTTP POST /write| QDB
+    RP -->|"market-ticks & market-anomalies<br/>2 Independent Consumer Groups"| Persist
+    Persist -->|"Dual-Trigger: 5k rows / 500ms<br/>ILP over HTTP POST /write"| QDB
 ```
-
 
 ---
 
-## Current Architecture & Status
+## System Architecture by Tier (End-to-End Data Flow)
+
+1. **Market Simulation Tier ([`generator/generator.go`](generator/generator.go))**: Simulates high-frequency order flow across 10 B3 equities (`PETR4`, `VALE3`, `ITUB4`, `BBDC4`, `ABEV3`, `WEGE3`, `RENT3`, `BBAS3`, `MGLU3`, `JBSS3`) using geometric random walks with a 0.1% probability of synthetic price/volume shocks. Wraps TCP sockets in a 64KB `bufio.Writer` (aligned with the Linux `lo` loopback MTU) and dispatches 60-tick bursts every 10ms to sustain **56,400–67,200 msgs/sec**.
+2. **Zero-Allocation Ingestion Gateway ([`main.go`](main.go))**: Accepts concurrent TCP streams on `:8008` and recycles `*[]byte` buffers via `sync.Pool` (`bufferPool`). Payloads pass through a bounded channel (`jobQueue`, capacity `50,000`) to `runtime.NumCPU()` workers, which validate JSON, extract the ticker symbol for FNV-1a partition hashing (`&kafka.Hash{}`), and hand the raw buffer pointer (`WriterData`) to an asynchronous `segmentio/kafka-go` producer (`Async: true`). Once Redpanda acknowledges a batch, `kafkaWriter.Completion` returns the `*[]byte` pointer directly to `sync.Pool` (**0 flat heap allocations per packet**).
+3. **Streaming Event Backbone (`Redpanda`)**: C++20 Seastar-based Kafka broker running with zero JVM GC pauses and dual named listeners (`internal://redpanda:29092` for container DNS and `external://172.18.0.1:9092` for hybrid host/Kind routing). Maintains two 4-partition topics: `market-ticks` and `market-anomalies`, preserving strict per-ticker FIFO ordering.
+4. **Idempotent Stream Inference & ML Tier ([`consumer/consumer.py`](consumer/consumer.py), [`consumer/detector.py`](consumer/detector.py))**:
+   * **Distributed Deduplication (`Valkey`)**: Before scoring any tick, workers execute an atomic check-and-set (`SET tick:<ticker>:<timestamp_ns> seen EX 60 NX`) against Valkey (`:6379`). Replayed messages during Kafka partition rebalances are acknowledged and dropped prior to inference.
+   * **Two-Tier Anomaly Detection**:
+     * *Tier 1 (Statistical)*: Per-ticker circular window (`maxlen=100`) computing rolling Z-scores with a Dual-Condition Guard ($|Z| > 3.0$ **and** $|\Delta P / P| \ge 2.0\%$) to eliminate low-volatility false positives.
+     * *Tier 2 (Unsupervised ML)*: `scikit-learn` `IsolationForest(n_estimators=50)` trained on Z-normalized 2D feature vectors $[z_{\text{price}}, z_{\text{volume}}]$, refitted every 100 ticks after a 500-tick regime stabilization delay (`ml_score_delay=500`), and evaluated via continuous path-length thresholding (`score_samples < -0.65`).
+5. **High-Throughput Time-Series Persistence ([`persister/persister.go`](persister/persister.go) & `QuestDB`)**: Two independent goroutines (`gobbler-ticks-persister-group` and `gobbler-anomalies-persister-group`) format zero-allocation InfluxDB Line Protocol (ILP) byte buffers using `strconv.Append*`. Flushes trigger every **5,000 rows** or **500ms** via HTTP POST to QuestDB (`:9000/write`). Under database outages, `flushWithRetry` holds the batch in RAM with cancellable exponential backoff (`50ms` $\rightarrow$ `1s`), preventing phantom offset skips and committing Kafka offsets strictly after HTTP `204 No Content` acknowledgment.
+
+---
+
+## Architecture Deep-Dives & Engineering Documentation
+
+| Document | Focus Area & Key Engineering Topics |
+| :--- | :--- |
+| **[`docs/post-mortem-2026-11-09.md`](docs/post-mortem-2026-11-09.md)** | **Phase 5 Post-Mortem**: 56k+ msgs/sec `pprof` flamegraph analysis, `*[]byte` `sync.Pool` refactoring (`-294,934` allocs), multi-tier chaos experiments, and fixing the "Phantom Offset Skip" bug. |
+| **[`docs/context.md`](docs/context.md)** | **Architectural Decision Record (ADR)**: System invariants, port mappings, and rationale table comparing every chosen technology against alternatives. |
+| **[`docs/mlinferencing.md`](docs/mlinferencing.md)** | **Stream ML & Math Guide**: Rolling window statistics, the Micro-Volatility Trap, Z-score feature normalization, and avoiding the `IsolationForest` Contamination Trap. |
+| **[`docs/redpanda.md`](docs/redpanda.md)** | **Event Broker Internals**: Thread-per-core Seastar architecture, FNV-1a key hashing, consumer group rebalancing, and `rpk` CLI runbook. |
+| **[`docs/valkey.md`](docs/valkey.md)** | **Distributed Caching**: At-least-once vs. effectively-once delivery, atomic `SETNX` with bounded TTL memory math, and why RDB snapshots are disabled. |
+| **[`docs/questdb.md`](docs/questdb.md)** | **Columnar Time-Series Storage**: InfluxDB Line Protocol (ILP) wire format, `SYMBOL` interning, `PARTITION BY DAY` sizing, and `ASOF JOIN` forensic queries. |
+| **[`docs/terraform.md`](docs/terraform.md)** | **Infrastructure-as-Code**: Declarative DAG resource graphs, Docker bridge networking, Dual Named Listeners, and Option C modular feature toggles. |
+| **[`docs/kubernetes.md`](docs/kubernetes.md)** | **Kubernetes & Autoscaling**: Multi-node Kind topology, `NodePort` ingress, Snap Docker `TMPDIR` workarounds, and partition-aligned HPA scaling. |
+
+---
+
+## Milestone Progression & Completed Phases
 
 ### Phase 1: Ingestion Gateway & Go Concurrency (✅ Completed)
 * **High-Throughput TCP Server**: Non-blocking connection accept loop listening on port `8008`.
 * **Bounded Concurrency**: Dedicated bounded queue channel (`50,000` capacity) feeding a CPU-scaled worker pool (`runtime.NumCPU()` workers).
-* **Buffer Safety**: Solves `bufio.Scanner` buffer recycling gotchas via clean byte copying.
-* **Production Lifecycle**: Intercepts OS signals (`SIGINT`, `SIGTERM`), tears down active sockets, and drains in-flight items without data loss.
+* **Buffer Safety**: Solved `bufio.Scanner` underlying array overwrite hazards (initially via defensive slice copying in Phase 1, later upgraded in Phase 5 to zero-allocation `*[]byte` recycling via `sync.Pool`).
+* **Production Lifecycle**: Intercepts OS signals (`SIGINT`, `SIGTERM`), tears down active sockets, and drains in-flight items across a 5-stage shutdown sequence without data loss.
 * **Observability**: Embedded real-time throughput reporter and live `pprof` diagnostic server on port `6060`.
 
 ### Phase 2: Event Streaming & Decoupled Architecture (✅ Completed)
@@ -56,7 +87,7 @@ flowchart TD
 * **Pure Go Producer**: Integrated `segmentio/kafka-go` (100% pure Go, zero Cgo overhead, multi-arch friendly for ARM64/Raspberry Pi).
 * **Keyed Partitioning**: Explicit hashing balancer (`&kafka.Hash{}`) using 10 asset tickers as partition keys, guaranteeing strict per-asset FIFO ordering across the 4 topic partitions.
 * **Zero-Allocation Forwarding**: Direct reuse of validated raw byte payloads, bypassing re-marshaling and eliminating garbage collector pressure.
-* **Failure Resilience & Backpressure**: Self-healing exponential backoff (`dispatchMsg`) that blocks worker routines on broker outages, safely propagating backpressure upstream to the TCP socket without dropping ticks or exceeding memory bounds.
+* **Failure Resilience & Backpressure**: Self-healing exponential backoff (`dispatchMsg`) and bounded queuing that absorbs broker outages without dropping ticks or exceeding memory bounds.
 * **Chaos Engineering Verified**: 192,754 / 192,754 ticks delivered during live mid-stream broker freeze tests with 100.000% data integrity.
 
 ### Phase 3: Stream Inference, Anomaly Detection & Distributed Caching (✅ Completed)
@@ -73,6 +104,14 @@ flowchart TD
 * **Production Containerization**: Multi-stage Dockerfiles for all microservices (`Dockerfile.gateway`, `Dockerfile.generator`, `Dockerfile.persister`, `Dockerfile.consumer`). Pure Go services compile to 100% static binaries on `scratch` (~2.5MB–8MB) and Python ML worker on `python:3.12-slim` (~413MB), all running as unprivileged user `appuser` (UID 10001).
 * **Declarative Infrastructure-as-Code (OpenTofu / Terraform)**: Codified auxiliary streaming backbone (`infra/auxiliary.tf`) on custom bridge network (`gobbler-network`), persistent volume (`questdb_data`), dual-listener Kafka networking (`internal` vs `external`), and modular Option C microservices toggle (`infra/workloads.tf`).
 * **Local Kubernetes (Kind) Orchestration & Autoscaling**: Multi-node Kind cluster (`k8s/kind-config.yaml`) with 1 control plane and 2 workers. Ingestion Gateway exposed via NodePort `30008` (ticks) and `30060` (pprof). Horizontal Pod Autoscaler (HPA) dynamically scaling the Python ML Consumer tier from 1 to 4 replicas (strictly partition-aligned to topic `market-ticks`), verified live with 133k+ ticks persisted and zero lag.
+
+### Phase 5: High-Load Profiling, Chaos Engineering & Automated Verification (✅ Completed)
+* **56,400+ msgs/sec Saturation & Memory Pool Refactoring**: Scaled synthetic generator with 64KB user-space loopback buffering (`lo` MTU-aligned) and asynchronous Kafka batching (`Async: true`). Eliminated **294,934 heap allocations** per 5s window in `handleConnection` by pooling `*[]byte` pointers in `sync.Pool` and recycling buffers asynchronously inside `kafkaWriter.Completion` via `kafka.Message.WriterData`.
+* **Multi-Tier Chaos Engineering & "Phantom Offset Skip" Remediation**:
+  * **Broker Freeze**: Verified 100.000% zero-loss delivery (675,720 / 675,720 ticks) across a mid-stream Redpanda container pause.
+  * **Worker Crash (`SIGKILL`)**: Verified instantaneous Redpanda consumer group partition reassignment and Valkey `SETNX` (`EX 60`) duplicate protection.
+  * **Database Outage**: Remediated the "Phantom Offset Skip" failure mode in `persister/persister.go` via `flushWithRetry` exponential backoff (`50ms` to `1s`), retaining unacknowledged batches in memory and verifying 454,042 ticks persisted across a live QuestDB container outage.
+* **Post-Mortem & One-Command E2E Harness**: Full engineering report in [`docs/post-mortem-2026-11-09.md`](docs/post-mortem-2026-11-09.md) and automated 7-stage verification script in [`scripts/e2e_test.sh`](scripts/e2e_test.sh).
 
 ---
 
@@ -96,6 +135,7 @@ flowchart TD
 │   ├── kubernetes.md            # Kubernetes & Kind orchestration guide, primitives & HPA
 │   ├── mlinferencing.md         # Study guide: rolling windows, Z-score, IsolationForest math
 │   ├── plan.md                  # Interactive project roadmap, milestones & definitions of done
+│   ├── post-mortem-2026-11-09.md # High-load profiling, sync.Pool & multi-tier chaos post-mortem
 │   ├── questdb.md               # Deep-dive architecture reference, ILP guide & SQL reference for QuestDB
 │   ├── redpanda.md              # Deep-dive architecture reference & CLI guide for Redpanda
 │   ├── terraform.md             # Terraform & OpenTofu concepts, Docker provider & CLI guide
@@ -119,9 +159,11 @@ flowchart TD
 │   ├── 04-consumer.yaml         # Python ML Inference Deployment (CPU requests for HPA)
 │   ├── 05-hpa.yaml              # Horizontal Pod Autoscaler (1 to 4 replicas, 60% CPU target)
 │   └── kind-config.yaml         # Multi-node Kind cluster definition (1 control-plane, 2 workers)
-├── main.go                      # Core Ingestion Gateway, TCP server & Kafka producer
+├── main.go                      # Core Ingestion Gateway, TCP server, sync.Pool & Kafka producer
 ├── persister/
 │   └── persister.go             # High-throughput ILP persistence worker (Kafka -> QuestDB)
+├── scripts/
+│   └── e2e_test.sh              # One-command automated E2E verification harness
 └── README.md                    # Project documentation
 ```
 
@@ -129,7 +171,16 @@ flowchart TD
 
 ## Quickstart & Execution Runbook
 
-Gobbler supports two execution and verification workflows:
+### One-Command Automated E2E Verification (Fastest)
+To build all container images, provision the full containerized stack via Terraform/OpenTofu, stream ~50,000+ msgs/sec of synthetic market order flow for 12 seconds, assert end-to-end persistence of ticks and ML anomalies in QuestDB, and automatically tear down all resources:
+```bash
+./scripts/e2e_test.sh
+```
+*(Pass `./scripts/e2e_test.sh --keep` to leave the containers running after verification for interactive SQL queries at `http://localhost:9000`.)*
+
+---
+
+Gobbler also supports two manual execution and verification workflows:
 1. **Track A: Kubernetes (Kind) Multi-Node Cluster (Recommended / Production Target)**: Full containerized deployment showcasing microservices on `scratch`, NodePort ingress routing, 12-factor ConfigMaps, and automated Horizontal Pod Autoscaling (HPA).
 2. **Track B: Local Host Developer Fast-Loop**: Provisions auxiliary streaming backends in Docker while running Go/Python binaries natively on the host for rapid sub-second code iteration.
 
@@ -261,18 +312,39 @@ For sub-second code editing and local debugging without running Kubernetes:
 
 ## Failure & Chaos Testing
 
-To test system resilience against broker failure:
+Gobbler is engineered and verified against multi-tier infrastructure failures (full metrics and root-cause analysis in [`docs/post-mortem-2026-11-09.md`](docs/post-mortem-2026-11-09.md)):
 
-1. While the generator and gateway are actively streaming, pause the broker:
+### 1. Broker Outage & Backpressure (`Redpanda`)
+1. While the generator and gateway are actively streaming at 56k+ msgs/sec, freeze the broker:
    ```bash
    docker pause redpanda
    ```
-2. **Observe**: The gateway logs warning retries (`context deadline exceeded. Retrying in 50ms...`), buffers up to 50,000 items in `jobQueue`, and backpressures the generator socket. Memory usage remains constant.
+2. **Observe**: The gateway buffers incoming payloads in `jobQueue` (`50,000` capacity) and internal producer batches without dropping messages or leaking heap memory.
 3. Unpause the broker:
    ```bash
    docker unpause redpanda
    ```
-4. **Observe**: The gateway immediately reconnects, flushes all pending batches to Redpanda, and resumes streaming without data loss.
+4. **Observe**: The gateway drains all queued batches, triggers `kafkaWriter.Completion` to return `*[]byte` buffers to `sync.Pool`, and achieves **100.000% zero-loss delivery**.
+
+### 2. Abrupt ML Worker Crash & Partition Rebalance (`SIGKILL`)
+1. Launch two consumer instances (`WORKER_ID=WORKER-A` and `WORKER_ID=WORKER-B`) in `gobbler-ml-consumers` so each owns 2 partitions.
+2. Terminate `WORKER-A` mid-stream with an uncatchable `SIGKILL`:
+   ```bash
+   kill -9 <WORKER_A_PID>
+   ```
+3. **Observe**: Redpanda revokes partitions `[0, 1]` from `WORKER-A` and assigns all 4 partitions `[0, 1, 2, 3]` to `WORKER-B`. Any uncommitted in-flight ticks replayed from the last committed offset are caught by Valkey's atomic `SETNX` (`EX 60`) guard, preventing duplicate ML alerts.
+
+### 3. Time-Series Database Outage & Backpressure (`QuestDB`)
+1. While `persister/persister.go` is actively flushing ILP batches, stop QuestDB mid-stream:
+   ```bash
+   docker stop questdb -t 1
+   ```
+2. **Observe**: `flushWithRetry` intercepts the connection failure and enters a cancellable exponential backoff loop (`50ms` $\rightarrow$ `100ms` $\rightarrow$ `200ms` $\rightarrow$ `400ms` $\rightarrow$ `800ms` $\rightarrow$ `1s`), retaining the unacknowledged batch in memory rather than truncating `batchMessages` or advancing Kafka offset commits (preventing the **Phantom Offset Skip** failure mode).
+3. Restart QuestDB:
+   ```bash
+   docker start questdb
+   ```
+4. **Observe**: The persister flushes the retained batch on the next retry tick, commits the exact Kafka offsets, and drains the backlog with zero lost rows.
 
 ---
 
@@ -293,8 +365,8 @@ Launch an interactive web dashboard (requires [Graphviz](https://graphviz.org/) 
   ```
 Navigate to `http://localhost:8081` in your browser to view Top lists, Call Graphs, and Flame Graphs.
 
-### 2. Interactive Terminal CLI Profiling
-Inspect hotspots directly in your terminal:
+### 2. Interactive Terminal CLI & Differential `sync.Pool` Profiling
+Inspect hotspots and compare before/after memory allocation profiles directly in your terminal:
 
 * **Analyze CPU Hotspots**:
   ```bash
@@ -305,13 +377,16 @@ Inspect hotspots directly in your terminal:
   * `list worker`: Disassemble and inspect per-line CPU time inside the `worker` function.
   * `web`: Export and open a SVG call graph in your default browser.
 
-* **Analyze Heap Allocations (Preparing for `sync.Pool` Optimization)**:
+* **Analyze Heap Allocations & Verify `sync.Pool` Zero-Allocation Impact**:
   ```bash
-  # Inspect total allocations over time (cumulative heap stress):
+  # Inspect cumulative object allocations over time:
+  go tool pprof -alloc_objects http://127.0.0.1:6060/debug/pprof/heap
+
+  # Inspect cumulative byte allocations over time:
   go tool pprof -alloc_space http://127.0.0.1:6060/debug/pprof/heap
 
-  # Inspect current live in-memory objects:
-  go tool pprof -inuse_space http://127.0.0.1:6060/debug/pprof/heap
+  # Differential comparison between baseline and sync.Pool profiles (-294,934 allocations):
+  go tool pprof -base baseline_heap_50k.pb.gz -top -alloc_objects syncpool_heap_50k.pb.gz
   ```
 
 * **Goroutine Leak Detection**:

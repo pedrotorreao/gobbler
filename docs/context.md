@@ -15,6 +15,7 @@ Gobbler is a distributed real-time financial market surveillance and anomaly det
 * **QuestDB Deep Dive**: [`questdb.md`](questdb.md)
 * **Terraform / IaC Deep Dive**: [`terraform.md`](terraform.md)
 * **Kubernetes / Kind Deep Dive**: [`kubernetes.md`](kubernetes.md)
+* **Post-Mortem & Chaos Engineering Report**: [`post-mortem-2026-11-09.md`](post-mortem-2026-11-09.md)
 
 ---
 
@@ -68,7 +69,7 @@ Gobbler is a distributed real-time financial market surveillance and anomaly det
    * `producer.flush()` in the `finally` block guarantees no buffered anomaly events are dropped on shutdown.
    * End-to-end verified live: `market-anomalies` topic consumed, confirming correct JSON schema, partition routing by ticker key, and FIFO ordering.
 
-### Phase 4: Time-Series Persistence & Infrastructure-as-Code (🚀 IN PROGRESS)
+### Phase 4: Time-Series Persistence & Infrastructure-as-Code (✅ COMPLETED)
 1. **QuestDB Ingestion Infrastructure (Step 1 - Complete)**: Added `questdb/questdb:latest` to [`docker-compose.yml`](../docker-compose.yml) exposing port `9000` (Web Console, REST, HTTP ILP), `9009` (TCP ILP), and `8812` (PGWire). Pre-created partitioned tables `market_ticks` and `market_anomalies` (`PARTITION BY DAY`) with symbol caching (`CAPACITY 16 CACHE`), and verified ILP HTTP writes and `ASOF JOIN` queries.
 2. **Go Persistence Worker (Step 2 - Built & Documented)**:
    * Built dedicated streaming worker in [`persister/persister.go`](../persister/persister.go).
@@ -76,7 +77,7 @@ Gobbler is a distributed real-time financial market surveillance and anomaly det
    * High-performance ILP formatting via `strconv.Append*` and slice buffer reuse.
    * Dual-trigger batching engine (`batchSize=5000` or `flushInterval=500ms`).
    * HTTP POST flushes to QuestDB `/write` endpoint with Keep-Alive connection pooling.
-7. Multi-partition offset commits (`reader.CommitMessages(ctx, batchKafkaMessages...)`) executed only post-flush acknowledgment (HTTP 204/200).
+   * Multi-partition offset commits (`reader.CommitMessages(ctx, batchKafkaMessages...)`) executed only post-flush acknowledgment (HTTP 204/200).
    * Clean shutdown lifecycle handling draining in-flight buffers under a 3-second bounded context timeout.
 3. **Microservices Containerization (Step 3 - Complete & Documented)**:
    * **12-Factor Configuration**: Integrated dynamic environment variable overrides (`KAFKA_BROKER`, `INGESTION_GATEWAY_ADDR`, `INGESTION_GATEWAY_PORT`, `PPROF_ADDR`, `QUESTDB_URL`, `VALKEY_HOST`, `VALKEY_PORT`) across Go and Python codebases.
@@ -95,7 +96,7 @@ Gobbler is a distributed real-time financial market surveillance and anomaly det
    * **Foundational Layer ([`infra/main.tf`](../infra/main.tf), [`infra/versions.tf`](../infra/versions.tf))**: Provisions dedicated bridge network `gobbler-network` with automatic container DNS, and named volume `questdb_data` mounted to `/var/lib/questdb`.
    * **Auxiliary Data Plane ([`infra/auxiliary.tf`](../infra/auxiliary.tf))**:
      - `valkey`: Configured with `--save "\"\""` to disable RDB snapshots for sub-millisecond in-memory cache operations, satisfying provider validation.
-     - `redpanda`: Configured with `--smp 1`, `--memory 1G`, and **Dual Named Listeners** (`internal://0.0.0.0:29092` advertised as `internal://redpanda:29092` for container-to-container traffic, and `external://0.0.0.0:9092` advertised as `external://localhost:9092` for host development and `rpk` CLI).
+     - `redpanda`: Configured with `--smp 1`, `--memory 1G`, and **Dual Named Listeners** (`internal://0.0.0.0:29092` advertised as `internal://redpanda:29092` for container-to-container traffic, and `external://0.0.0.0:9092` advertised as `external://172.18.0.1:9092` for hybrid host + Kind cluster routing).
      - `questdb`: Configured with ports `9000` (Web/REST/ILP), `9009` (TCP ILP), `8812` (PGWire), and persistent volume mount.
    * **Option C Modular Architecture ([`infra/workloads.tf`](../infra/workloads.tf))**:
      - Feature toggle via `count = var.enable_microservices ? 1 : 0`.
@@ -105,6 +106,7 @@ Gobbler is a distributed real-time financial market surveillance and anomaly det
    * **Live Verification**: `terraform apply` successfully provisioned all resources; verified container health, Redpanda `rpk cluster info`, Valkey `PONG`, and QuestDB SQL REST API (`/exec?query=show+tables`).
 5. **Local Kubernetes (Kind) Orchestration & Autoscaling (Step 5 - Complete & Verified)**:
    * **Multi-Node Cluster ([`k8s/kind-config.yaml`](../k8s/kind-config.yaml))**: 3 nodes (1 control-plane, 2 workers) with `extraPortMappings` for `30008 -> 8008` (TCP ingress) and `30060 -> 6060` (pprof).
+   * **Snap Docker Image Loading Fix**: Bypassed Snap's strict `/tmp` mount namespace confinement by setting `TMPDIR=$HOME/tmp` during `kind load docker-image`.
    * **Hybrid Ingress Architecture**:
      - `gobbler-gateway`: `Deployment` (50m CPU / 32Mi RAM request) + `NodePort Service` exposing ports 30008 and 30060.
      - `gobbler-persister`: Pure background consumer `Deployment` (50m CPU / 32Mi RAM request). No Service required.
@@ -113,6 +115,32 @@ Gobbler is a distributed real-time financial market surveillance and anomaly det
    * **Kafka Advertised Listener Fix**: Configured Redpanda's external advertised address as `172.18.0.1:9092` in [`infra/auxiliary.tf`](../infra/auxiliary.tf) to eliminate the Kafka advertised listener trap where pods resolved `localhost` internally.
    * **Horizontal Pod Autoscaler ([`k8s/05-hpa.yaml`](../k8s/05-hpa.yaml))**: Autoscaling targeted at `gobbler-consumer` (min 1, max 4, 60% CPU utilization).
    * **Live Load & Scalability Verification**: Ingested streaming load via host generator; HPA detected 501% CPU utilization and scaled consumer replicas from 1 to 4 (perfect 1:1 alignment across all 4 Kafka partitions); persister flushed **133,459 ticks** and **2,796 anomalies** to QuestDB with 0 lag across all partitions.
+
+### Phase 5: High-Load Profiling, Chaos Engineering & Interview Packaging (✅ COMPLETED)
+1. **High-Load Saturation & Baseline Profiling (Step 1 - Complete)**:
+   * **Problem Encountered**: The original synthetic generator maxed out around ~1,600 msgs/sec because unbuffered `conn.Write` calls invoked a `write()` syscall per JSON line, `time.Sleep(500µs)` suffered from OS scheduler timer slack, and the gateway's `kafka.Writer` blocked worker goroutines on synchronous broker round-trips (`Async: false`).
+   * **Solution**: Refactored [`generator/generator.go`](../generator/generator.go) to wrap TCP sockets in a 64KB `bufio.Writer` (matching Linux loopback `lo` MTU) with 60-tick bursts per 10ms across 10 tickers and a 5ms periodic flush ticker. Enabled `Async: true` on `kafka.Writer` in [`main.go`](../main.go), surging throughput to **56,400+ msgs/sec** (peaking at 67,200 msgs/sec).
+   * **Memory Profiling Discovery**: Captured `baseline_heap_50k.pb.gz` via `net/http/pprof` (`-alloc_objects` / `-alloc_space`), pinpointing **294,934 heap allocations (22.50 MB in 5s)** inside `handleConnection` (`payloadCopy := make([]byte, len(rawBytes))`).
+2. **Zero-Allocation Buffer Recycling via `sync.Pool` (Step 2 - Complete)**:
+   * **Problems Encountered**:
+     1. Passing a value slice `[]byte` (24-byte header) to `sync.Pool.Put(any)` triggers an interface boxing allocation on the heap (`runtime.convTslice`).
+     2. Under `Async: true`, `kafkaWriter.WriteMessages` returns immediately while retaining a reference to `msg.Value` in background batch queues; returning the buffer to `sync.Pool` inside `worker` causes a concurrent data race when `handleConnection` overwrites the recycled slice.
+   * **Solution**: Pooled pointer-to-slice `*[]byte` (`make([]byte, 0, 512)`) in `bufferPool`, changed `jobQueue` to `chan *[]byte`, attached `WriterData: bufPtr` to each `kafka.Message`, and deferred `bufferPool.Put(bufPtr)` to the `kafkaWriter.Completion` callback (with defensive `bufferPool.Put` on early `json.Unmarshal` or `ctx.Done()` exits in `worker`).
+   * **Verification**: Differential `pprof -base baseline_heap_50k.pb.gz -alloc_objects syncpool_heap_50k.pb.gz` proved **-294,934 allocations eliminated** (0 flat allocations in `handleConnection`).
+3. **Multi-Tier Chaos Engineering & The "Phantom Offset Skip" Fix (Step 3 - Complete)**:
+   * **Experiment 1 (Broker Drop)**: Paused Redpanda (`docker pause redpanda`) for 4s mid-stream at 56k msgs/sec; verified 100.000% zero-loss delivery (**+675,720 ticks**) upon unpause.
+   * **Experiment 2 (Consumer Crash & Rebalance)**: Added `WORKER_ID` tag and log throttling (every 1,000th normal tick) to [`consumer/consumer.py`](../consumer/consumer.py). Killed `WORKER-A` with `kill -9` mid-stream; verified instant partition handoff to `WORKER-B` (`rpk group describe gobbler-ml-consumers`) and zero duplicate anomalies via Valkey `SETNX` (`EX 60`).
+   * **Experiment 3 (Database Outage & "Phantom Offset Skip")**:
+     - **Problem Encountered**: In [`persister/persister.go`](../persister/persister.go), when `flushToQuestDB` failed, the worker skipped `CommitMessages` (good) but still truncated `batchMessages = batchMessages[:0]` and continued calling `reader.FetchMessage`. Because `kafka.Reader` advances its internal cursor on fetch, a subsequent successful batch commit permanently jumped over the failed batch's offsets in Kafka (silent data loss). Additionally, the shutdown drain block unconditionally committed offsets even if the final flush failed.
+     - **Solution**: Implemented `flushWithRetry` with exponential backoff (`50ms` initial up to `1s` ceiling) using `time.NewTimer` + `select` on `<-ctx.Done()`, keeping `batchMessages` in RAM until QuestDB acknowledges HTTP 204/200 and gating the shutdown `CommitMessages` behind an `else` branch. Verified live by stopping QuestDB (`docker stop questdb -t 1`) mid-stream and restarting (`docker start questdb`), persisting **+454,042 ticks** with zero loss.
+4. **Written Post-Mortem (Step 4 - Complete)**:
+   * Authored [`docs/post-mortem-2026-11-09.md`](post-mortem-2026-11-09.md) with GitHub-relative links, profiling flamegraph tables, chaos timelines, and reproduction commands.
+5. **Automated End-to-End Verification Harness (Step 5 - Complete)**:
+   * Built [`scripts/e2e_test.sh`](../scripts/e2e_test.sh) with extensive shell-scripting educational notes (`set -euo pipefail`, `trap cleanup EXIT`, readiness polling, PCRE JSON extraction).
+   * **Problems Encountered & Solved**:
+     1. *Topic Auto-Creation Race*: Starting microservices simultaneously with Redpanda causes consumers to trigger 1-partition topic auto-creation before 4-partition topics exist. Solved with a **Two-Stage Terraform Apply** (`enable_microservices=false` -> initialize 4-partition topics & QuestDB DDLs -> `enable_microservices=true`).
+     2. *Host Port 6379 Collision*: Local system `redis-server` daemon bound to `127.0.0.1:6379` blocked Valkey container host port binding. Solved by probing `ss -tln` for `:6379` and dynamically exporting `TF_VAR_valkey_port=16379` while preserving internal `valkey:6379` container DNS on `gobbler-network`.
+   * **Live Verification**: Executed `./scripts/e2e_test.sh` end-to-end; ingested and persisted **640,001 market ticks** and **31 anomalies** in QuestDB in a 12-second burst followed by clean automatic teardown.
 
 ---
 
@@ -138,20 +166,29 @@ Gobbler is a distributed real-time financial market surveillance and anomaly det
 | **Storage Topology** | **Two Dedicated Tables (`market_ticks`, `market_anomalies`)** | Single Unified Table | Time-series databases are append-only (no row `UPDATE`). Dedicated tables keep tick ingestion at maximum append throughput, keep anomaly audit queries instantaneous without full table scans, and allow clean `ASOF JOIN` queries. |
 | **Table Partitioning** | **`PARTITION BY DAY`** | `PARTITION BY HOUR` | For local development and test runs, `BY DAY` bounds open file descriptors and directory sprawl. Under continuous 50k msgs/sec (~180M rows/hr), `BY HOUR` reaches 1-3GB partitions, aligning with QuestDB's 100MB-10GB partition sizing rule. |
 | **Persistence Batching** | **Dual-Trigger (`5,000` rows or `500ms`)** | Per-message streaming insert | Optimizes QuestDB ILP chunk sizes while bounding freshness latency to 500ms during quiet periods. Consumer offsets are committed only post-flush to guarantee at-least-once persistence. |
+| **Container Base Images** | **`FROM scratch` (Go) & `python:3.12-slim` (Python)** | `alpine` for Python / `ubuntu` for Go | Go binaries are compiled with `CGO_ENABLED=0` into static ELF binaries (~2.5–8MB) that need zero OS userspace. Conversely, Python ML wheels (`numpy`, `scipy`, `scikit-learn`, `confluent-kafka`) rely on `manylinux` (`glibc`); Alpine (`musl`) forces 15-minute C/Fortran source builds. |
+| **Snap Docker & Kind Loading** | **`TMPDIR=$HOME/tmp kind load docker-image`** | Default `/tmp` export | Ubuntu Snap Docker runs inside a confined mount namespace where `/tmp` is isolated from the host `/tmp`, causing `kind load` tar exports to fail with `unable toopen ... no such file`. Redirecting `TMPDIR` to `$HOME/tmp` bridges the Snap boundary cleanly. |
+| **Kafka Advertised Listeners (Hybrid K8s/Host)** | **`external://172.18.0.1:9092` (`gobbler-network` gateway)** | `external://localhost:9092` | When Redpanda advertises `localhost:9092`, Kind pods connect to `172.18.0.1:9092` for bootstrap metadata and are told to reconnect to `localhost:9092`—which resolves to the pod's own loopback (`ECONNREFUSED`). Advertising the Docker bridge gateway IP `172.18.0.1:9092` works from both host processes and Kind pods. |
+| **Generator Loopback Framing & Timer Granularity** | **64KB `bufio.Writer` + 60-tick bursts every `10ms`** | Unbuffered `conn.Write` + `500µs` sleep per tick | Per-line `conn.Write` invokes a kernel `write()` syscall per tick, and Linux timer slack turns `500µs` sleeps into `1–2ms`, capping throughput at ~1,600 msgs/sec. A 64KB user-space buffer matches the Linux loopback (`lo`) MTU (65,536 bytes), amortizing syscalls across `10ms` bursts to exceed **56,400+ msgs/sec**. |
+| **Gateway Kafka Producer Mode** | **Asynchronous (`Async: true` + `Completion` callback)** | Synchronous (`Async: false`) | Synchronous `WriteMessages` blocks each worker goroutine until a batch fills (`BatchTimeout: 5ms`) and the broker round-trip completes, capping 12 workers at ~2,400 msgs/sec. `Async: true` decouples worker handoff from broker I/O, scaling to 56k+ msgs/sec. |
+| **Memory Pool Representation & Lifecycle (`sync.Pool`)** | **Pooling `*[]byte` (512B cap) + recycling via `kafka.Message.WriterData` in `Completion`** | Pooling `[]byte` value slices or recycling inside `worker` | Passing a 24-byte `[]byte` header to `sync.Pool.Put(any)` allocates a heap box (`runtime.convTslice`). Furthermore, with `Async: true`, `WriteMessages` returns while background batches still read `msg.Value`; recycling in `worker` causes a data race. Recycling `*[]byte` via `WriterData` inside `Completion` eliminated **294,934 heap allocations** per 5s window with zero races. |
+| **Persistence Outage Recovery ("Phantom Offset Skip")** | **Cancellable Exponential Backoff (`flushWithRetry`: `50ms` -> `1s`) retaining `batchMessages` in RAM** | Logging error and truncating `batchMessages[:0]` without committing | Truncating `batchMessages[:0]` after a failed DB write while keeping the consumer loop running allows `reader.FetchMessage` to advance its cursor. When the DB recovers and a later batch commits, Kafka jumps over the failed batch's offsets (silent data loss). Blocking in `flushWithRetry` holds the batch in memory and applies natural backpressure to Kafka until QuestDB recovers. |
+| **Automated E2E Provisioning Order & Host Port Collisions** | **Two-Stage Terraform Apply + Dynamic `TF_VAR_valkey_port` Override in `scripts/e2e_test.sh`** | Single-pass `terraform apply` with hardcoded host ports | Starting microservices simultaneously with Redpanda causes consumers to auto-create 1-partition topics before 4-partition topics are initialized. Furthermore, developer hosts often have a local `redis-server` on `:6379`; probing `ss -tln` and exporting `TF_VAR_valkey_port=16379` avoids host port conflicts while preserving `valkey:6379` internal container DNS. |
 
 ---
 
 ## 4. Configuration Invariants & Network Ports
 
-* **TCP Gateway Port**: `127.0.0.1:8008`
-* **Gateway pprof Port**: `127.0.0.1:6060` (`/debug/pprof/`)
-* **Redpanda Kafka Port**: `localhost:9092`
+* **TCP Gateway Port**: `127.0.0.1:8008` (Host) / `30008` (Kind NodePort)
+* **Gateway pprof Port**: `127.0.0.1:6060` (Host) / `30060` (Kind NodePort, `/debug/pprof/`)
+* **Redpanda Kafka Port**: `localhost:9092` (Host) / `172.18.0.1:9092` (External Advertised) / `redpanda:29092` (Internal Docker DNS)
 * **Redpanda Admin Port**: `localhost:9644`
 * **Valkey Port**: `localhost:6379`
 * **Target Topic**: `market-ticks` (Pre-created with **4 partitions**)
 * **Anomaly Topic**: `market-anomalies` (Pre-created with **4 partitions**, keyed by ticker)
 * **Consumer Group ID**: `gobbler-ml-consumers`
-* **Gateway Buffer Capacity**: `50,000` payloads (`jobQueue`)
+* **Gateway Buffer Capacity**: `50,000` payloads (`jobQueue chan *[]byte`)
+* **Gateway Buffer Pool**: `sync.Pool` storing `*[]byte` (initial capacity `512` bytes)
 * **Detector Parameters**:
   * `window_size=100` ticks (circular buffer per ticker)
   * `min_observations=20` ticks (Tier 1 cold-start guard)
@@ -160,20 +197,21 @@ Gobbler is a distributed real-time financial market surveillance and anomaly det
   * `refit_interval=100` ticks (Tier 2 periodic re-fit cadence)
   * `ml_score_delay=500` ticks (Tier 2 deferred activation threshold)
   * `ml_score_threshold=-0.65` (Tier 2 isolated-outlier boundary)
-* **Gateway Buffer Capacity**: `50,000` payloads (`jobQueue`)
 * **Producer Batching Tuning**:
   * `BatchSize: 100` messages
   * `BatchTimeout: 5 * time.Millisecond`
   * `RequiredAcks: kafka.RequireOne`
   * `WriteTimeout: 2 * time.Second`
+  * `Async: true` (buffer recycling triggered via `Completion` callback inspecting `kafka.Message.WriterData`)
 * **Retry Parameters**: Initial backoff `50ms`, multiplier `2x`, max ceiling `1s`.
 * **Valkey Deduplication TTL**: `60` seconds (`EX 60`).
 * **QuestDB Web Console / REST / HTTP ILP Port**: `localhost:9000`
 * **QuestDB TCP ILP Port**: `localhost:9009`
 * **QuestDB PostgreSQL Wire Port**: `localhost:8812`
 * **QuestDB Target Tables**: `market_ticks` (`PARTITION BY DAY`), `market_anomalies` (`PARTITION BY DAY`)
-* **Persister Consumer Group ID**: `gobbler-persister-group`
+* **Persister Consumer Group IDs**: `gobbler-ticks-persister-group`, `gobbler-anomalies-persister-group`
 * **Persister Batch Tuning**: `MaxBatchSize: 5000` rows, `MaxFlushInterval: 500ms`
+* **Persister Flush Retry**: `flushWithRetry` exponential backoff (`50ms` initial, `2x` multiplier, `1s` max ceiling, cancellable via `ctx.Done()`).
 
 ---
 
@@ -191,42 +229,64 @@ Gobbler is a distributed real-time financial market surveillance and anomaly det
 │   ├── consumer.py              # Kafka consumer: dedup, inference loop, anomaly producer, manual commits
 │   ├── detector.py              # RollingZScoreDetector: two-tier Z-Score + IsolationForest
 │   └── requirements.txt         # Python dependencies (confluent-kafka, redis, numpy, scikit-learn)
-├── docker-compose.yml           # Redpanda & Valkey container service definitions
+├── docker-compose.yml           # Redpanda, Valkey & QuestDB container service definitions
 ├── docs/
 │   ├── context.md               # Continuous architecture state (this file)
+│   ├── kubernetes.md            # Kubernetes & Kind orchestration guide, primitives & HPA
 │   ├── mlinferencing.md         # Study guide: rolling windows, Z-score, IsolationForest math
 │   ├── plan.md                  # Project roadmap & progress tracker
+│   ├── post-mortem-2026-11-09.md # High-load profiling, sync.Pool & multi-tier chaos post-mortem
 │   ├── questdb.md               # QuestDB concepts, ILP format, table partitioning & SQL reference
 │   ├── redpanda.md              # Redpanda concepts, CLI guide & architecture reference
 │   ├── terraform.md             # Terraform & OpenTofu concepts, Docker provider & CLI guide
-│   ├── valkey.md                # Valkey concepts, Idempotent Consumer & CLI guide
-│   └── kubernetes.md            # Kubernetes & Kind orchestration guide, primitives & HPA
+│   └── valkey.md                # Valkey concepts, Idempotent Consumer & CLI guide
 ├── generator/
-│   └── generator.go             # Package main - standalone exchange simulator (10 B3 assets)
+│   └── generator.go             # Package main - standalone exchange simulator (10 B3 assets, 64KB buffer)
 ├── go.mod                       # Module github.com/pedrotorreao/gobbler
 ├── go.sum                       # Dependency checksums
-├── main.go                      # Package main - Ingestion Gateway, pprof & Kafka producer
+├── infra/
+│   ├── auxiliary.tf             # Redpanda, Valkey & QuestDB Docker container resources
+│   ├── main.tf                  # Docker network (gobbler-network) & QuestDB named volume
+│   ├── outputs.tf               # Provisioned service endpoint outputs
+│   ├── variables.tf             # Input variables & enable_microservices toggle
+│   ├── versions.tf              # Terraform & kreuzwerker/docker provider requirements
+│   └── workloads.tf             # Optional containerized microservice resources
+├── k8s/
+│   ├── 01-configmap.yaml        # Centralized environment config pointing to 172.18.0.1
+│   ├── 02-gateway.yaml          # Gateway Deployment & NodePort Service (30008, 30060)
+│   ├── 03-persister.yaml        # Persister Deployment
+│   ├── 04-consumer.yaml         # Python ML Consumer Deployment
+│   ├── 05-hpa.yaml              # HorizontalPodAutoscaler (1-4 replicas @ 60% CPU)
+│   └── kind-config.yaml         # 3-node Kind cluster topology with host port mappings
+├── main.go                      # Package main - Ingestion Gateway, sync.Pool, pprof & async Kafka producer
 ├── persister/
-│   └── persister.go             # Package main - ILP persistence worker (Kafka -> QuestDB)
+│   └── persister.go             # Package main - ILP persistence worker with flushWithRetry
+├── scripts/
+│   └── e2e_test.sh              # Automated E2E verification harness (IaC -> Stream -> Assert -> Teardown)
 └── README.md                    # Public project overview & quickstart
 ```
 
 ---
 
-## 6. Immediate Next Steps: Phase 5 (High-Load Profiling, Chaos Engineering & Memory Pool Refactoring)
+## 6. Immediate Next Steps: Phase 5 (High-Load Profiling, Chaos Engineering & Memory Pool Refactoring — ✅ ALL STEPS COMPLETED)
 
 * [x] **Step 1**: High-Load Saturation & Empirical Profiling.
   - Saturated Go Ingestion Gateway at **56,400+ msgs/sec** (676,800 msgs in 12s) using optimized synthetic generator (64KB loopback buffer, 60 ticks/10ms bursts) and asynchronous Kafka producer (`Async: true`).
-  - Captured baseline heap allocation profile ([`baseline_heap_50k.pb.gz`](../baseline_heap_50k.pb.gz)).
+  - Captured baseline heap allocation profile (`baseline_heap_50k.pb.gz`).
   - Identified primary heap allocation bottleneck: `handleConnection` inlining allocating fresh slices on every scan (`payloadCopy := make([]byte, len(rawBytes))`) accounting for **294,934 heap allocations (22.50 MB)** in a 5-second sampling window. Secondary bottleneck: JSON unmarshaling (`MarketTick`) in `worker`.
 * [x] **Step 2**: Buffer Recycling via `sync.Pool`.
   - Implemented `sync.Pool` storing `*[]byte` (pre-allocated 512-byte capacity) to eliminate slice header boxing.
   - Linked end-to-end zero-copy lifecycle across `handleConnection`, `jobQueue chan *[]byte`, `worker`, and asynchronous Kafka writer via `kafka.Message.WriterData` and `kafkaWriter.Completion` callback.
   - Handled defensive early returns on JSON unmarshal errors and shutdown channel drain.
-  - Re-ran 56,000+ msgs/sec benchmark (675,060 msgs in 12s, peaking at 67,200 msgs/sec) and captured [`syncpool_heap_50k.pb.gz`](../syncpool_heap_50k.pb.gz).
+  - Re-ran 56,000+ msgs/sec benchmark (675,060 msgs in 12s, peaking at 67,200 msgs/sec) and captured `syncpool_heap_50k.pb.gz`.
   - Comparative profiling (`pprof -base baseline_heap_50k.pb.gz syncpool_heap_50k.pb.gz`) confirmed **-294,934 object allocations eliminated** from the network ingestion loop, reducing per-packet heap allocations in `handleConnection` to **0**.
-* [ ] **Step 3**: Chaos Engineering & Failure Recovery (broker pause, worker pod kill, database disconnect resilience).
-* [ ] **Step 4**: Architecture documentation, benchmark playbooks & post-mortem.
-* [ ] **Step 5**: Automated E2E verification script ([`scripts/e2e_test.sh`](../scripts/e2e_test.sh)).
+* [x] **Step 3**: Chaos Engineering & Failure Recovery.
+  - **Broker Drop**: Mid-stream Redpanda container pause proved 100.000% zero-loss delivery (675,720 / 675,720 ticks) with asynchronous buffer queuing and `Completion` callback drainage on unpause.
+  - **Consumer Crash & Rebalance**: Abrupt `SIGKILL` (`kill -9`) of active ML worker triggered instant Redpanda partition reassignment to surviving workers with Valkey atomic `SETNX` (TTL 60s) idempotency preventing duplicate inference.
+  - **Database Outage**: Simulated QuestDB container crash during streaming; implemented `flushWithRetry` with exponential backoff (`50ms` to `1s`) and cancellable `time.NewTimer` select loop in [`persister/persister.go`](../persister/persister.go). Eliminated phantom offset skips, held in-memory buffers under backpressure, and verified 100% zero-loss batch delivery upon database recovery (454k+ ticks persisted).
+* [x] **Step 4**: Architecture documentation, benchmark playbooks & post-mortem.
+  - Authored comprehensive system post-mortem in [`docs/post-mortem-2026-11-09.md`](post-mortem-2026-11-09.md) covering high-load memory profiling, the `sync.Pool` zero-allocation refactoring, failure analysis across all 3 tiers, the "phantom offset skip" discovery and remediation, architectural invariants, and local benchmark reproduction playbooks.
+* [x] **Step 5**: Automated E2E verification script ([`scripts/e2e_test.sh`](../scripts/e2e_test.sh)).
+  - Implemented a 7-stage automated E2E harness with `set -euo pipefail`, `trap cleanup EXIT` (`--keep` flag supported), dynamic `TF_VAR_valkey_port` collision detection, multi-stage image builds, two-stage Terraform provisioning, readiness polling, 12-second synthetic load streaming, and QuestDB SQL row assertions (**640,001 ticks** and **31 anomalies** verified live).
 
 
